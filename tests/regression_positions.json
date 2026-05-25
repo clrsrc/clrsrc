@@ -1,0 +1,94 @@
+{
+  "_doc": "Regression-Position-Suite — bei jedem Build via tools/run_regression.py prüfen. Bei Fail: Code-Regression. Erweitern bei jedem neuen Bug-Diagnose-Event.",
+  "_schema": {
+    "fen": "Position-Startpunkt",
+    "tc_ms": "[wtime, btime, winc, binc] in ms — Engine sucht mit diesem TC",
+    "checks": {
+      "max_move_time_pct": "Move darf nicht mehr als X% der wtime verbrauchen (Time-Mgmt-Check)",
+      "min_depth": "Minimale erreichte Tiefe (Search-Performance)",
+      "max_move_time_ms": "Hartes Limit Move-Time (absolut)",
+      "expected_move_set": "Engine MUSS einen dieser Züge spielen (Best-Move-Tests)"
+    }
+  },
+  "positions": [
+    {
+      "id": "tm_blitz_startpos",
+      "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "tc_ms": [300000, 300000, 0, 0],
+      "checks": {
+        "max_move_time_pct": 12,
+        "min_depth": 8,
+        "comment": "Startpos TC 5+0: Engine darf nicht >12% (=36s) verbrauchen"
+      }
+    },
+    {
+      "id": "tm_blitz_open_middlegame",
+      "fen": "r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 4 4",
+      "tc_ms": [300000, 300000, 0, 0],
+      "checks": {
+        "max_move_time_pct": 12,
+        "min_depth": 8,
+        "comment": "Standard Vier-Springer-Eröffnung — typischer Out-of-Book-First-Move"
+      }
+    },
+    {
+      "id": "tm_rapid_complex_middlegame",
+      "fen": "r2q1rk1/pp1bbppp/2np1n2/2p1p3/4P3/1BNP1N2/PPP2PPP/R1BQR1K1 w - - 0 9",
+      "tc_ms": [900000, 900000, 10000, 10000],
+      "checks": {
+        "max_move_time_pct": 8,
+        "min_depth": 12,
+        "comment": "Rapid 15+10, komplexe Mittelspielstellung — max 8% (72s) für einen Move"
+      }
+    },
+    {
+      "id": "tm_low_time_safety",
+      "fen": "r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - 4 4",
+      "tc_ms": [5000, 5000, 0, 0],
+      "checks": {
+        "max_move_time_pct": 50,
+        "min_depth": 4,
+        "max_move_time_ms": 2500,
+        "comment": "Time-Trouble 5s — sollte trotzdem antworten, max 50% von 5s = 2.5s"
+      }
+    },
+    {
+      "id": "search_mate_in_3",
+      "fen": "8/8/8/8/8/3k4/3R4/3K4 b - - 0 1",
+      "tc_ms": [10000, 10000, 0, 0],
+      "checks": {
+        "min_depth": 8,
+        "comment": "K+R vs K Endgame — Standard-Win, Engine muss saubere Tiefe erreichen"
+      }
+    },
+    {
+      "id": "search_only_legal_kings",
+      "fen": "8/8/8/8/8/3k4/1q6/3K4 w - - 0 1",
+      "tc_ms": [10000, 10000, 0, 0],
+      "checks": {
+        "expected_move_set": ["d1c1", "d1e1"],
+        "max_move_time_ms": 1000,
+        "comment": "King in Check durch Queen — nur 2 legale Moves, Engine muss schnell entscheiden (<1s)"
+      }
+    },
+    {
+      "id": "tb_six_man_win",
+      "fen": "8/8/8/3k4/8/8/4P3/3K4 w - - 0 1",
+      "tc_ms": [10000, 10000, 0, 0],
+      "checks": {
+        "min_depth": 5,
+        "comment": "5-Mann TB-Win wenn Syzygy aktiv — sehr schneller exit erwartet"
+      }
+    },
+    {
+      "id": "tm_bullet_increment",
+      "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+      "tc_ms": [180000, 180000, 2000, 2000],
+      "checks": {
+        "max_move_time_pct": 15,
+        "min_depth": 8,
+        "comment": "Bullet 3+2 Startpos — max 15% (27s)"
+      }
+    }
+  ]
+}

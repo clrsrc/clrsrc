@@ -1,0 +1,35 @@
+# clrsrc .gitignore — ALLOWLIST strategy.
+#
+# The working directory contains tens of GB of training data, logs, binaries,
+# third-party engines, cluster-management scripts with hard-coded hosts, and
+# personal notes. To avoid ever leaking any of that, we ignore EVERYTHING by
+# default and then explicitly re-include only the curated set that makes up the
+# published project.
+
+# 1. Ignore everything in the repo root.
+/*
+
+# 2. Re-include the curated release set.
+!/.gitignore
+!/.cargo/
+!/Cargo.toml
+!/Cargo.lock
+!/LICENSE
+!/README.md
+!/CREDITS.md
+!/CLUSTER.md
+!/src/
+!/tests/
+
+# 3. Safety nets inside the re-included directories.
+#    (Nothing build- or cache-related should ever be committed.)
+**/target/
+**/__pycache__/
+*.rs.bk
+*.tmp
+
+# 4. Never commit large binary artifacts — they are published as Release assets.
+*.nnue
+*.bin
+*.exe
+*.pgn
