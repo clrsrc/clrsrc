@@ -42,16 +42,20 @@ The [Releases](../../releases) page provides:
 |----------|-------------|
 | `clrsrc.exe` | Windows x86-64 binary (build it yourself for best performance — see below) |
 | `clrsrc_v32_seed_b.nnue` | The trained evaluation network |
+| `jugernaut_v4.book` | Opening / experience book in JBK2 format (optional — see below) |
 
 Place the `.nnue` file next to the executable (it is the default `EvalFile`),
 or point the `EvalFile` UCI option at it.
 
-**Opening book:** clrsrc does *not* bundle one. It works with any standard
-Polyglot `.bin` book — enable the `OwnBook` option and point `BookFile` at the
-book of your choice. (Plenty of freely-licensed Polyglot books exist online.
-The book used internally during clrsrc's development was assembled from
-third-party, partly proprietary books and therefore cannot be redistributed
-here.)
+**Opening book.** clrsrc now ships an opening/experience book,
+`jugernaut_v4.book` (~192k positions, JBK2 v2 format). It was generated entirely
+from self-play and is freely redistributable under this project's license. To
+use it, point the `ExpFile` UCI option at the file and set `PlayFromExp true`
+(see the options table below). It is **optional** and **off by default** — the
+engine's strength figures and `bench` do not depend on it.
+
+clrsrc also still supports any standard Polyglot `.bin` book via the legacy
+`OwnBook` / `BookFile` options.
 
 ---
 
@@ -83,7 +87,7 @@ file. From the command line:
 ```
 $ ./clrsrc
 uci
-id name clrsrc 1.0.0
+id name clrsrc 1.0.1
 ...
 uciok
 ```
@@ -98,6 +102,11 @@ uciok
 | `OwnBook` | false | Use a Polyglot opening book |
 | `BookFile` | — | Path to the Polyglot `.bin` book |
 | `BestBookMove` | true | Pick the highest-weighted book move (vs. weighted-random) |
+| `ExpFile` | — | Path to a JBK2 experience/opening book (e.g. `jugernaut_v4.book`) |
+| `PlayFromExp` | false | Play book moves from the `ExpFile` |
+| `BookVariety` | strict | Book-move tolerance: `strict` / `±15cp` / `±30cp`, with a WDL filter |
+| `LearnDuringPlay` | false | Append the engine's deep root judgments to `<ExpFile>.overlay` |
+| `ExpMinSaveDepth` | 16 | Minimum depth for a position to be written when learning |
 | `SyzygyPath` | — | Directory with Syzygy tablebase files |
 | `SyzygyProbeDepth` | 1 | Minimum depth for TB probing |
 | `SyzygyProbeLimit` | 6 | Max pieces to probe |
@@ -111,6 +120,8 @@ clrsrc bench [depth] [nnue]      # fixed-position node benchmark
 clrsrc perft <depth> [fen]       # move-generation perft
 clrsrc datagen <games> <soft_nodes> <out.bin> <threads> [book.bin]
 clrsrc rescore <args>            # relabel training data with Stockfish
+clrsrc exp <file.book> [fen]     # inspect a JBK2 book: entries + selected move
+clrsrc expmerge <book> <overlay> <out> [--clrsrc-mirror]   # consolidate a learned overlay
 ```
 
 ---

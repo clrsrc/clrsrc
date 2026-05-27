@@ -75,6 +75,18 @@ fn main() {
             "rescore" => {
                 rescore::run(&args[2..]);
             }
+            "exp" => {
+                let path = args.get(2).map(|s| s.as_str()).unwrap_or("jugernaut_v2.book");
+                let fen = if args.len() > 3 {
+                    args[3..].join(" ")
+                } else {
+                    board::STARTPOS_FEN.to_string()
+                };
+                run_exp(path, &fen);
+            }
+            "expmerge" => {
+                run_expmerge(&args[2..]);
+            }
             _ => {
                 uci::uci_loop();
             }
@@ -244,4 +256,85 @@ fn run_bench(depth: i32, nnue_path: &str) {
         total_nodes
     };
     println!("Bench: {} nodes {} nps", total_nodes, nps);
+}
+
+/// Validate a JBK2 experience/book file: load it, probe a position, show entries + selected move.
+/// Usage: clrsrc exp <file.book> [FEN]
+fn run_exp(path: &str, fen: &str) {
+    let book = match book::ExpBook::load(path) {
+        Some(b) => b,
+        None => {
+            eprintln!("exp: failed to load {}", path);
+            return;
+        }
+    };
+    println!("exp file: {} ({} entries)", path, book.entry_count());
+
+    let mut pos = board::Position::from_fen(fen).expect("valid FEN");
+    println!("position: {}", pos.to_fen());
+
+    let entries = book.probe(&pos);
+    println!("{} entries for this position:", entries.len());
+    for e in &entries {
+        println!(
+            "  packed_move={:#06x} score={} depth={} count={} src={} flags={} wdl_w={} wdl_l={} jug={} sf={} clrsrc={}",
+            e.packed_move, e.score, e.depth, e.count, e.source, e.flags, e.wdl_w, e.wdl_l, e.jug_score, e.sf_score, e.clrsrc_score
+        );
+    }
+
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    for variety in 0..=2u8 {
+        match book.probe_best(&mut pos, variety, seed.wrapping_add(variety as u64)) {
+            Some(mv) => println!("probe_best(variety={}) = {}", variety, mv),
+            None => println!("probe_best(variety={}) = none", variety),
+        }
+    }
+}
+
+/// Merge a JBK2 main book + overlay into a new sorted main file (multi-source policy §11).
+/// Usage: clrsrc expmerge <book> <overlay> <out> [--clrsrc-mirror]
+/// `--clrsrc-mirror` makes the canonical `score` mirror clrsrc_score first (for a clrsrc.exp home
+/// book); default mirrors jug→sf→clrsrc (jugernaut.book priority, matches the golden fixture).
+fn run_expmerge(args: &[String]) {
+    if args.len() < 3 {
+        eprintln!("usage: clrsrc expmerge <book> <overlay> <out> [--clrsrc-mirror]");
+        return;
+    }
+    let (book_p, overlay_p, out_p) = (&args[0], &args[1], &args[2]);
+    let clrsrc_first = args.iter().any(|a| a == "--clrsrc-mirror");
+
+    let mut combined = Vec::new();
+    let mut n_book = 0;
+    let mut n_overlay = 0;
+    if let Some(b) = book::ExpBook::load(book_p) {
+        n_book = b.entry_count();
+        combined.extend(b.all_entries());
+    } else {
+        eprintln!("expmerge: book {} not loadable (treating as empty)", book_p);
+    }
+    if let Some(o) = book::ExpBook::load(overlay_p) {
+        n_overlay = o.entry_count();
+        combined.extend(o.all_entries());
+    } else {
+        eprintln!("expmerge: overlay {} not loadable (treating as empty)", overlay_p);
+    }
+    if combined.is_empty() {
+        eprintln!("expmerge: nothing to merge");
+        return;
+    }
+    let merged = book::merge_entries(&combined, clrsrc_first);
+    match book::write_sorted_main(out_p, &merged) {
+        Ok(()) => println!(
+            "expmerge: book={} + overlay={} → {} merged entries ({} mirror) written to {}",
+            n_book,
+            n_overlay,
+            merged.len(),
+            if clrsrc_first { "clrsrc-first" } else { "jug-first" },
+            out_p
+        ),
+        Err(e) => eprintln!("expmerge: write failed: {}", e),
+    }
 }

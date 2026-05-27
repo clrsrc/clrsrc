@@ -87,6 +87,9 @@ pub struct SearchInfo {
     // Datagen support
     pub silent: bool,
     pub root_score: i32,
+    // Deepest fully-completed iterative-deepening depth this search (0 if none).
+    // Used by the experience-learning write path (uci.rs) as the save-depth gate.
+    pub completed_depth: i32,
     // Node-based time management
     pub best_move_nodes: u64,
     // Forced-move detection (Patch B Phase 2): tracked per root pvs() call.
@@ -133,6 +136,7 @@ impl SearchInfo {
             game_history_len: 0,
             silent: false,
             root_score: 0,
+            completed_depth: 0,
             best_move_nodes: 0,
             root_second_best: i32::MIN,
             root_moves_count: 0,
@@ -155,6 +159,7 @@ impl SearchInfo {
         self.cont_history_2.age();
         self.capture_history.age();
         self.best_move_nodes = 0;
+        self.completed_depth = 0;
         self.tt.new_generation();
         // Truncate any hashes added during previous search, keep game history
         self.hash_history.truncate(self.game_history_len);
@@ -322,6 +327,9 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
         }
 
         best_score = score;
+        // This iteration completed without an abort (the stopped/should_stop break above
+        // returns before this point for depth>1), so `depth` is a fully-searched depth.
+        info.completed_depth = depth;
         if info.pv_len[0] > 0 {
             best_move = info.pv[0][0];
         }

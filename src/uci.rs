@@ -9,7 +9,9 @@ use crate::board::Position;
 use crate::perft;
 use crate::search::{self, SearchInfo};
 use crate::tune;
-use crate::book::Book;
+use crate::book::{Book, ExpBook, ExpEntry, OverlayWriter, encode_poly_move, polyglot_hash,
+    EXP_SOURCE_ENGINE, EXP_FLAG_VALIDATED, EXP_FLAG_MATE, EXP_SCORE_NONE};
+use std::sync::Mutex;
 use crate::tt::{self, SharedTT};
 use crate::time::{self, TimeControl, TimeManager};
 
@@ -25,6 +27,24 @@ pub fn uci_loop() {
     let mut own_book = false;
     let mut best_book_move = true;
     let mut book: Option<Book> = None;
+    // JBK2 experience/book (read-only consumer); opt-in via PlayFromExp.
+    let mut exp: Option<ExpBook> = None;
+    let mut play_from_exp = false;
+    let mut book_variety: u8 = 0;
+    // Experience-learning write path (opt-in via LearnDuringPlay; all default off → frozen behavior).
+    let mut learn = false;
+    let mut exp_min_depth: i32 = 16;
+    let mut exp_path: Option<String> = None;
+    // Created lazily once learning is on and an ExpFile path is known. Shared with the search
+    // thread (1 write/move at the root, so a mutex is uncontended).
+    let mut exp_writer: Option<Arc<Mutex<OverlayWriter>>> = None;
+    // Advancing RNG state for book variety (seeded once from the wall clock, then incremented
+    // per probe so consecutive book moves decorrelate regardless of clock granularity).
+    let mut exp_rng: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x1234_5678_9abc_def0)
+        | 1;
 
     // Search thread handle for ponder support
     let mut search_handle: Option<thread::JoinHandle<(Move, SearchInfo, i32)>> = None;
@@ -46,7 +66,7 @@ pub fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                println!("id name clrsrc 1.0.0");
+                println!("id name clrsrc 1.0.1");
                 println!("id author clrsrc contributors");
                 println!("option name Hash type spin default 64 min 1 max 65536");
                 println!("option name Threads type spin default 1 min 1 max 256");
@@ -54,6 +74,11 @@ pub fn uci_loop() {
                 println!("option name OwnBook type check default false");
                 println!("option name BestBookMove type check default true");
                 println!("option name BookFile type string default <empty>");
+                println!("option name ExpFile type string default <empty>");
+                println!("option name PlayFromExp type check default false");
+                println!("option name LearnDuringPlay type check default false");
+                println!("option name ExpMinSaveDepth type spin default 16 min 1 max 100");
+                println!("option name BookVariety type spin default 0 min 0 max 2");
                 println!("option name SyzygyPath type string default <empty>");
                 println!("option name SyzygyProbeDepth type spin default 1 min 1 max 100");
                 println!("option name SyzygyProbeLimit type spin default 6 min 0 max 7");
@@ -68,7 +93,7 @@ pub fn uci_loop() {
                 println!("uciok");
             }
             "setoption" => {
-                cmd_setoption(&tokens, &mut info, &mut tt, &mut num_threads, &mut own_book, &mut best_book_move, &mut book);
+                cmd_setoption(&tokens, &mut info, &mut tt, &mut num_threads, &mut own_book, &mut best_book_move, &mut book, &mut exp, &mut play_from_exp, &mut book_variety, &mut learn, &mut exp_min_depth, &mut exp_path);
             }
             "isready" => {
                 println!("readyok");
@@ -113,13 +138,28 @@ pub fn uci_loop() {
                 }
                 let is_white = pos.side == crate::types::WHITE;
 
-                // Book probe (not during ponder)
-                if !is_ponder && own_book && !tc.infinite && tc.depth == 0 {
-                    if let Some(ref bk) = book {
-                        let rng_val = pos.hash ^ (game_ply as u64 * 6364136223846793005);
-                        if let Some(book_move) = bk.probe(&mut pos, rng_val, best_book_move) {
-                            println!("bestmove {}", book_move);
-                            continue;
+                // Book probe (not during ponder): try the JBK2 experience book first
+                // (richer: WDL-filtered), then fall back to the Polyglot book.
+                if !is_ponder && !tc.infinite && tc.depth == 0 {
+                    if play_from_exp {
+                        if let Some(ref eb) = exp {
+                            // Advancing counter mixed with the position hash → good variety even
+                            // when the wall-clock seed has coarse granularity.
+                            exp_rng = exp_rng.wrapping_add(0x9E3779B97F4A7C15);
+                            let rng_val = exp_rng ^ pos.hash;
+                            if let Some(exp_move) = eb.probe_best(&mut pos, book_variety, rng_val) {
+                                println!("bestmove {}", exp_move);
+                                continue;
+                            }
+                        }
+                    }
+                    if own_book {
+                        if let Some(ref bk) = book {
+                            let rng_val = pos.hash ^ (game_ply as u64 * 6364136223846793005);
+                            if let Some(book_move) = bk.probe(&mut pos, rng_val, best_book_move) {
+                                println!("bestmove {}", book_move);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -136,6 +176,21 @@ pub fn uci_loop() {
                 let tt = Arc::clone(&info.tt);
                 let search_tc = tc;
                 let smp_threads = num_threads;
+
+                // Experience learning: lazily open the overlay writer once, then hand a cheap
+                // Arc clone to the search thread. Captured copies keep the closure self-contained.
+                if learn && exp_writer.is_none() {
+                    if let Some(ref p) = exp_path {
+                        let overlay = format!("{}.overlay", p);
+                        exp_writer = Some(Arc::new(Mutex::new(OverlayWriter::open(&overlay))));
+                        eprintln!("info string LearnDuringPlay writing to {}", overlay);
+                    } else {
+                        eprintln!("info string LearnDuringPlay enabled but no ExpFile set; nothing written");
+                    }
+                }
+                let learn_writer = if learn { exp_writer.clone() } else { None };
+                let learn_min_depth = exp_min_depth;
+                let learn_is_ponder = is_ponder;
 
                 // Move full info (including NNUE) into thread; create fresh placeholder
                 let mut thread_info = std::mem::replace(&mut info, SearchInfo::new(Arc::clone(&tt)));
@@ -194,6 +249,47 @@ pub fn uci_loop() {
                     time::set_stop(true);
                     for h in helpers {
                         let _ = h.join();
+                    }
+
+                    // Experience learning: persist this root's deep judgment, once per move.
+                    // Gated to fully-completed searches at/above the save depth; never during
+                    // ponder (the root is a guessed line). Flush immediately for crash-safety
+                    // (the bot watcher hard-kills between games, so buffering would lose data).
+                    if !learn_is_ponder && best_move != Move::NULL {
+                        if let Some(ref w) = learn_writer {
+                            if thread_info.completed_depth >= learn_min_depth {
+                                let root_pos = Position::from_fen(&fen).unwrap();
+                                let rs = thread_info.root_score;
+                                let is_mate = rs.abs() >= search::MATE_IN_MAX;
+                                let score16 = rs.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
+                                let mut flags = EXP_FLAG_VALIDATED;
+                                if is_mate {
+                                    flags |= EXP_FLAG_MATE;
+                                }
+                                let entry = ExpEntry {
+                                    key: polyglot_hash(&root_pos),
+                                    packed_move: encode_poly_move(best_move),
+                                    score: score16,
+                                    depth: thread_info.completed_depth.clamp(0, i16::MAX as i32) as i16,
+                                    count: 1,
+                                    source: EXP_SOURCE_ENGINE,
+                                    flags,
+                                    wdl_w: 0,
+                                    wdl_l: 0,
+                                    nnue_eval: EXP_SCORE_NONE,
+                                    // jug_score is Jugernaut-exclusive (JBK2 §11) — never written
+                                    // by clrsrc. clrsrc's eval goes into clrsrc_score (offset 28),
+                                    // gated by the SOURCE_CLRSRC bit. `score` mirrors it.
+                                    jug_score: EXP_SCORE_NONE,
+                                    sf_score: EXP_SCORE_NONE,
+                                    clrsrc_score: score16,
+                                };
+                                if let Ok(mut wl) = w.lock() {
+                                    wl.push(entry);
+                                    wl.flush();
+                                }
+                            }
+                        }
                     }
 
                     // Format bestmove with ponder move.
@@ -277,8 +373,11 @@ pub fn uci_loop() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_setoption(tokens: &[&str], info: &mut SearchInfo, tt: &mut SharedTT, num_threads: &mut usize,
-                 own_book: &mut bool, best_book: &mut bool, book: &mut Option<Book>) {
+                 own_book: &mut bool, best_book: &mut bool, book: &mut Option<Book>,
+                 exp: &mut Option<ExpBook>, play_from_exp: &mut bool, book_variety: &mut u8,
+                 learn: &mut bool, exp_min_depth: &mut i32, exp_path: &mut Option<String>) {
     if tokens.len() >= 5 && tokens[1] == "name" {
         let val_idx = tokens.iter().position(|&t| t == "value");
         if let Some(vi) = val_idx {
@@ -348,6 +447,43 @@ fn cmd_setoption(tokens: &[&str], info: &mut SearchInfo, tt: &mut SharedTT, num_
                         if book.is_none() {
                             eprintln!("info string Book load failed: {}", path);
                         }
+                    }
+                }
+                "expfile" => {
+                    let path = tokens[vi + 1..].join(" ");
+                    if path == "<empty>" || path.is_empty() {
+                        *exp = None;
+                        *exp_path = None;
+                        eprintln!("info string ExpFile disabled");
+                    } else {
+                        *exp = ExpBook::load(&path);
+                        if exp.is_none() {
+                            eprintln!("info string ExpFile load failed: {}", path);
+                        }
+                        // Remember the path so the learning write path can target <path>.overlay,
+                        // even when ExpFile fails to load as a readable book (fresh learning run).
+                        *exp_path = Some(path);
+                    }
+                }
+                "playfromexp" => {
+                    let val = tokens[vi + 1].to_lowercase();
+                    *play_from_exp = val == "true" || val == "1";
+                    eprintln!("info string PlayFromExp = {}", *play_from_exp);
+                }
+                "learnduringplay" => {
+                    let val = tokens[vi + 1].to_lowercase();
+                    *learn = val == "true" || val == "1";
+                    eprintln!("info string LearnDuringPlay = {}", *learn);
+                }
+                "expminsavedepth" => {
+                    if let Ok(d) = tokens[vi + 1].parse::<i32>() {
+                        *exp_min_depth = d.clamp(1, 100);
+                        eprintln!("info string ExpMinSaveDepth = {}", *exp_min_depth);
+                    }
+                }
+                "bookvariety" => {
+                    if let Ok(v) = tokens[vi + 1].parse::<u8>() {
+                        *book_variety = v.min(2);
                     }
                 }
                 "ponder" => {

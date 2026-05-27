@@ -10,16 +10,14 @@ pub static PONDERING: AtomicBool = AtomicBool::new(false);
 /// When false: engine ignores `go ponder` commands (treats as normal `go`) and does NOT
 /// append "ponder X" to its `bestmove` output. Default true (standard UCI behavior).
 static ALLOW_PONDER: AtomicBool = AtomicBool::new(true);
-/// Signals TimeManager to reset its clock on ponderhit
-static PONDERHIT_RESET: AtomicBool = AtomicBool::new(false);
 
 pub fn signal_ponderhit() {
-    PONDERHIT_RESET.store(true, Ordering::Relaxed);
+    // End pondering. We deliberately do NOT reset the search clock: the time already spent
+    // pondering (on the opponent's clock) counts against this move's budget, so the soft/hard
+    // limits — measured from `go ponder` — prevent over-allocating our own clock after the hit.
+    // Resetting here (old behavior) granted a full fresh budget post-hit while the search was
+    // already deep, so one giant iteration blew the clock → ponderhit time-forfeits (fixed 27.05).
     PONDERING.store(false, Ordering::Relaxed);
-}
-
-pub fn check_ponderhit_reset() -> bool {
-    PONDERHIT_RESET.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok()
 }
 
 pub fn should_stop() -> bool {
@@ -226,10 +224,9 @@ impl TimeManager {
 
     /// Should we stop searching NOW? (checked during search)
     pub fn should_stop_hard(&mut self, nodes: u64) -> bool {
-        // On ponderhit, reset the clock so time starts from now
-        if check_ponderhit_reset() {
-            self.start = Instant::now();
-        }
+        // While pondering, never stop on time (it's the opponent's clock). After ponderhit,
+        // `is_pondering` is false and the clock keeps running from `go ponder`, so ponder time
+        // counts against the budget — total wall time is bounded by hard_limit, never over-allocating.
         if is_pondering() { return false; }
         if self.max_nodes > 0 && nodes >= self.max_nodes {
             return true;

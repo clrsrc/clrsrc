@@ -411,3 +411,670 @@ fn decode_poly_move(pos: &mut Position, raw: u16) -> Option<Move> {
 
     None
 }
+
+/// Encode a clrsrc Move into a Polyglot raw_move (u16). Inverse of `decode_poly_move`.
+/// Castling is stored king->rook (e1h1 / e1a1) per the Polyglot convention; promotions
+/// use bits 12..15 (1=N, 2=B, 3=R, 4=Q). No position needed — the move's flags suffice.
+pub fn encode_poly_move(mv: Move) -> u16 {
+    let from = mv.from();
+    let to = mv.to();
+    let from_file = file_of(from) as u16;
+    let from_rank = rank_of(from) as u16;
+    let to_rank = rank_of(to) as u16;
+
+    // Polyglot stores castling as king-captures-own-rook (king -> rook square), while clrsrc
+    // encodes king -> destination. Remap the file to the rook's.
+    let to_file = match mv.flags() {
+        Move::FLAG_KING_CASTLE => 7,  // h-file rook
+        Move::FLAG_QUEEN_CASTLE => 0, // a-file rook
+        _ => file_of(to) as u16,
+    };
+
+    let promo: u16 = match mv.flags() {
+        Move::FLAG_KNIGHT_PROMO | Move::FLAG_KNIGHT_PROMO_CAP => 1,
+        Move::FLAG_BISHOP_PROMO | Move::FLAG_BISHOP_PROMO_CAP => 2,
+        Move::FLAG_ROOK_PROMO | Move::FLAG_ROOK_PROMO_CAP => 3,
+        Move::FLAG_QUEEN_PROMO | Move::FLAG_QUEEN_PROMO_CAP => 4,
+        _ => 0,
+    };
+
+    to_file | (to_rank << 3) | (from_file << 6) | (from_rank << 9) | (promo << 12)
+}
+
+// ---- JBK2 Experience/Book reader (read-only consumer of jugernaut_v2.book) ----
+// 32-byte little-endian header + 32-byte little-endian entries, sorted by (key, packed_move).
+// Format is locked for version 2; a version mismatch is rejected rather than misread.
+
+const JBK2_MAGIC: &[u8; 4] = b"JBK2";
+const JBK2_HEADER_SIZE: usize = 32;
+const JBK2_ENTRY_SIZE: usize = 32;
+/// Sentinel for "score not set" (matches the writer's SCORE_NONE).
+pub const EXP_SCORE_NONE: i16 = i16::MIN;
+
+// `source`/`flags` bit values per the authoritative JBK2 spec (chess_engine/rust_engine/
+// docs/exp_v2_format.md §7/§8). clrsrc never interprets these — they are carried through for
+// the offline `expmerge`, so they MUST match the jugernaut definitions to merge correctly.
+/// JBK2 §8 source bit5 = "clrsrc" (`SOURCE_CLRSRC`). Dedicated bit for this engine's live-learning
+/// judgments, confirmed with the jugernaut instance 2026-05-27 (bit4=0x10 is already SOURCE_PGN —
+/// reusing it would silently collide). When this bit is set, `clrsrc_score` (offset 28) is valid.
+/// clrsrc never sets the Jugernaut bit (0x02) and never writes `jug_score`.
+pub const EXP_SOURCE_ENGINE: u8 = 0b0010_0000;
+/// JBK2 §7 flags bit0 = VALIDATED (move verified legal / written by a completed search).
+pub const EXP_FLAG_VALIDATED: u8 = 0x01;
+/// JBK2 §7 flags bit4 = MATE_SCORE (the stored `score` is a mate score, not centipawns).
+pub const EXP_FLAG_MATE: u8 = 0x10;
+/// JBK2 §3 header flags bit1 = OVERLAY (this file is an append-only overlay, not the sorted main).
+const JBK2_HEADER_FLAG_OVERLAY: u16 = 0x0002;
+/// JBK2 §3 header flags bit0 = SORTED (the entries are sorted by (key, packed_move) — main file).
+const JBK2_HEADER_FLAG_SORTED: u16 = 0x0001;
+/// JBK2 §8 source bit1 = Jugernaut (analysis-engine judgment; owns `jug_score`).
+const EXP_SOURCE_JUGERNAUT: u8 = 0x02;
+/// JBK2 §8 source bit2 = Stockfish (oracle judgment; owns `sf_score`).
+const EXP_SOURCE_STOCKFISH: u8 = 0x04;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ExpEntry {
+    pub key: u64,
+    pub packed_move: u16,
+    pub score: i16,
+    pub depth: i16,
+    pub count: u16,
+    pub source: u8,
+    pub flags: u8,
+    pub wdl_w: u16,
+    pub wdl_l: u16,
+    pub nnue_eval: i16,
+    pub jug_score: i16,
+    pub sf_score: i16,
+    /// Offset 28: foreign-engine (clrsrc) eval. Valid only when `source & EXP_SOURCE_ENGINE`.
+    pub clrsrc_score: i16,
+}
+
+impl ExpEntry {
+    fn from_bytes(b: &[u8]) -> ExpEntry {
+        ExpEntry {
+            key: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+            packed_move: u16::from_le_bytes(b[8..10].try_into().unwrap()),
+            score: i16::from_le_bytes(b[10..12].try_into().unwrap()),
+            depth: i16::from_le_bytes(b[12..14].try_into().unwrap()),
+            count: u16::from_le_bytes(b[14..16].try_into().unwrap()),
+            source: b[16],
+            flags: b[17],
+            wdl_w: u16::from_le_bytes(b[18..20].try_into().unwrap()),
+            wdl_l: u16::from_le_bytes(b[20..22].try_into().unwrap()),
+            nnue_eval: i16::from_le_bytes(b[22..24].try_into().unwrap()),
+            jug_score: i16::from_le_bytes(b[24..26].try_into().unwrap()),
+            sf_score: i16::from_le_bytes(b[26..28].try_into().unwrap()),
+            clrsrc_score: i16::from_le_bytes(b[28..30].try_into().unwrap()),
+        }
+    }
+
+    fn to_bytes(&self) -> [u8; JBK2_ENTRY_SIZE] {
+        let mut b = [0u8; JBK2_ENTRY_SIZE];
+        b[0..8].copy_from_slice(&self.key.to_le_bytes());
+        b[8..10].copy_from_slice(&self.packed_move.to_le_bytes());
+        b[10..12].copy_from_slice(&self.score.to_le_bytes());
+        b[12..14].copy_from_slice(&self.depth.to_le_bytes());
+        b[14..16].copy_from_slice(&self.count.to_le_bytes());
+        b[16] = self.source;
+        b[17] = self.flags;
+        b[18..20].copy_from_slice(&self.wdl_w.to_le_bytes());
+        b[20..22].copy_from_slice(&self.wdl_l.to_le_bytes());
+        b[22..24].copy_from_slice(&self.nnue_eval.to_le_bytes());
+        b[24..26].copy_from_slice(&self.jug_score.to_le_bytes());
+        b[26..28].copy_from_slice(&self.sf_score.to_le_bytes());
+        b[28..30].copy_from_slice(&self.clrsrc_score.to_le_bytes());
+        // bytes 30..32 = reserved u16 = 0
+        b
+    }
+}
+
+/// JBK2 book/experience file, read-only. Loaded fully into memory; binary-searched per probe.
+pub struct ExpBook {
+    data: Vec<u8>, // entries region only (header stripped)
+    num_entries: usize,
+}
+
+impl ExpBook {
+    /// Open a JBK2 file. Returns None on missing file, bad magic, or unsupported version.
+    pub fn load(path: &str) -> Option<ExpBook> {
+        let raw = std::fs::read(path).ok()?;
+        if raw.len() < JBK2_HEADER_SIZE || &raw[0..4] != JBK2_MAGIC {
+            eprintln!("info string exp: {} is not a JBK2 file", path);
+            return None;
+        }
+        let version = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+        if version != 2 {
+            eprintln!("info string exp: unsupported JBK2 version {} (expected 2)", version);
+            return None;
+        }
+        let declared = u64::from_le_bytes(raw[8..16].try_into().unwrap()) as usize;
+        let avail = (raw.len() - JBK2_HEADER_SIZE) / JBK2_ENTRY_SIZE;
+        let num_entries = declared.min(avail);
+        let data = raw[JBK2_HEADER_SIZE..JBK2_HEADER_SIZE + num_entries * JBK2_ENTRY_SIZE].to_vec();
+        eprintln!("info string exp: opened {} ({} entries, v{})", path, num_entries, version);
+        Some(ExpBook { data, num_entries })
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.num_entries
+    }
+
+    /// All entries in file order (works for sorted main files and unsorted overlays alike).
+    pub fn all_entries(&self) -> Vec<ExpEntry> {
+        (0..self.num_entries).map(|i| self.entry(i)).collect()
+    }
+
+    #[inline]
+    fn entry_key(&self, idx: usize) -> u64 {
+        let off = idx * JBK2_ENTRY_SIZE;
+        u64::from_le_bytes(self.data[off..off + 8].try_into().unwrap())
+    }
+
+    #[inline]
+    fn entry(&self, idx: usize) -> ExpEntry {
+        let off = idx * JBK2_ENTRY_SIZE;
+        ExpEntry::from_bytes(&self.data[off..off + JBK2_ENTRY_SIZE])
+    }
+
+    /// First index whose key == `key`, or None.
+    fn find_first(&self, key: u64) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.num_entries;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.entry_key(mid) < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo < self.num_entries && self.entry_key(lo) == key {
+            Some(lo)
+        } else {
+            None
+        }
+    }
+
+    /// All entries for the position (same Polyglot key), in file order.
+    pub fn probe(&self, pos: &Position) -> Vec<ExpEntry> {
+        let key = polyglot_hash(pos);
+        let mut out = Vec::new();
+        if let Some(first) = self.find_first(key) {
+            let mut i = first;
+            while i < self.num_entries && self.entry_key(i) == key {
+                out.push(self.entry(i));
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Pick a move for the position. `variety`: 0=strict best, 1=±15cp, 2=±30cp tolerance.
+    /// WDL filter drops statistically losing moves; a popularity (count) floor drops offbeat junk.
+    /// variety 0: deterministic — highest depth, then count, then score.
+    /// variety >0: uniform-random over the tolerance+WDL+popularity pool, seeded by `rng`
+    /// (count-weighting is too peaked here — one mainline dominates — so uniform gives genuine
+    /// opening spread, bounded in quality by the score cutoff, WDL filter, and count floor).
+    pub fn probe_best(&self, pos: &mut Position, variety: u8, rng: u64) -> Option<Move> {
+        let entries = self.probe(pos);
+        if entries.is_empty() {
+            return None;
+        }
+        let eff_variety = variety;
+        let best_score = entries.iter().map(|e| e.score).max().unwrap();
+        let cutoff = match eff_variety {
+            1 => best_score.saturating_sub(15),
+            2 => best_score.saturating_sub(30),
+            _ => best_score,
+        };
+        let in_cutoff: Vec<&ExpEntry> = entries.iter().filter(|e| e.score >= cutoff).collect();
+        // WDL filter: require loss-rate < 50% once we have a meaningful sample.
+        let wdl_ok: Vec<&ExpEntry> = in_cutoff
+            .iter()
+            .copied()
+            .filter(|e| {
+                let total = e.wdl_w as i32 + e.wdl_l as i32;
+                total < 6 || (e.wdl_l as i32) * 2 < total + 2
+            })
+            .collect();
+        let pool = if wdl_ok.is_empty() { in_cutoff } else { wdl_ok };
+
+        if eff_variety == 0 {
+            // Deterministic best.
+            let best = pool
+                .iter()
+                .max_by(|a, b| {
+                    a.depth
+                        .cmp(&b.depth)
+                        .then(a.count.cmp(&b.count))
+                        .then(a.score.cmp(&b.score))
+                })
+                .unwrap();
+            return decode_poly_move(pos, best.packed_move);
+        }
+
+        // Popularity gate: polyglot-sourced entries carry score=0 (no real eval), so the score
+        // cutoff alone lets offbeat junk (e.g. 1.g4) into the pool. Drop moves whose visit count
+        // is below max_count/20 — keeps actually-played mainlines, removes sidelines.
+        let max_count = pool.iter().map(|e| e.count).max().unwrap_or(0);
+        let floor = max_count / 20;
+        let quality: Vec<&ExpEntry> = pool.iter().copied().filter(|e| e.count >= floor).collect();
+        let final_pool = if quality.is_empty() { pool } else { quality };
+
+        // Mix the seed (splitmix64 finalizer): Windows clock granularity leaves the low bits of a
+        // time-based seed near-constant, which would bias `rng % len` for small pools.
+        let mut z = rng.wrapping_add(0x9E3779B97F4A7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+
+        // Uniform-random over the qualifying pool for genuine opening variety.
+        let idx = (z % final_pool.len() as u64) as usize;
+        decode_poly_move(pos, final_pool[idx].packed_move)
+    }
+}
+
+/// Merge a flat list of entries (main + overlay concatenated) per the JBK2 multi-source policy
+/// (`exp_v2_format.md §11`). Groups by (key, packed_move); for each group:
+/// - `source`/`flags` OR'd; `count`/`wdl_w`/`wdl_l` saturating-added.
+/// - per-source scores (`jug_score` / `sf_score` / `clrsrc_score`) gated on the owning source bit,
+///   higher per-source depth wins. Foreign engines never touch `jug_score`/`sf_score`.
+/// - `depth` = max of the contributing per-source depths (0 if no score source).
+/// - `nnue_eval` = first non-sentinel seen.
+/// - `score` = canonical mirror. `clrsrc_first=false` → jug→sf→clrsrc→0 (jugernaut.book priority);
+///   `clrsrc_first=true` → clrsrc→jug→sf→0 (clrsrc.exp home priority).
+/// Returns entries sorted by (key, packed_move) ascending — ready for a sorted main file.
+pub fn merge_entries(entries: &[ExpEntry], clrsrc_first: bool) -> Vec<ExpEntry> {
+    use std::collections::BTreeMap;
+    struct Acc {
+        e: ExpEntry,
+        jug_depth: i32,
+        sf_depth: i32,
+        clrsrc_depth: i32,
+    }
+    let mut map: BTreeMap<(u64, u16), Acc> = BTreeMap::new();
+    for src in entries {
+        let acc = map.entry((src.key, src.packed_move)).or_insert_with(|| Acc {
+            e: ExpEntry {
+                key: src.key,
+                packed_move: src.packed_move,
+                score: 0,
+                depth: 0,
+                count: 0,
+                source: 0,
+                flags: 0,
+                wdl_w: 0,
+                wdl_l: 0,
+                nnue_eval: EXP_SCORE_NONE,
+                jug_score: EXP_SCORE_NONE,
+                sf_score: EXP_SCORE_NONE,
+                clrsrc_score: EXP_SCORE_NONE,
+            },
+            jug_depth: -1,
+            sf_depth: -1,
+            clrsrc_depth: -1,
+        });
+        acc.e.source |= src.source;
+        acc.e.flags |= src.flags;
+        acc.e.count = acc.e.count.saturating_add(src.count);
+        acc.e.wdl_w = acc.e.wdl_w.saturating_add(src.wdl_w);
+        acc.e.wdl_l = acc.e.wdl_l.saturating_add(src.wdl_l);
+        if acc.e.nnue_eval == EXP_SCORE_NONE && src.nnue_eval != EXP_SCORE_NONE {
+            acc.e.nnue_eval = src.nnue_eval;
+        }
+        let d = src.depth as i32;
+        if src.source & EXP_SOURCE_JUGERNAUT != 0 && src.jug_score != EXP_SCORE_NONE && d >= acc.jug_depth {
+            acc.e.jug_score = src.jug_score;
+            acc.jug_depth = d;
+        }
+        if src.source & EXP_SOURCE_STOCKFISH != 0 && src.sf_score != EXP_SCORE_NONE && d >= acc.sf_depth {
+            acc.e.sf_score = src.sf_score;
+            acc.sf_depth = d;
+        }
+        if src.source & EXP_SOURCE_ENGINE != 0 && src.clrsrc_score != EXP_SCORE_NONE && d >= acc.clrsrc_depth {
+            acc.e.clrsrc_score = src.clrsrc_score;
+            acc.clrsrc_depth = d;
+        }
+    }
+    let mut out = Vec::with_capacity(map.len());
+    for (_, acc) in map {
+        let mut e = acc.e;
+        e.depth = acc.jug_depth.max(acc.sf_depth).max(acc.clrsrc_depth).max(0) as i16;
+        let mirror = if clrsrc_first {
+            [e.clrsrc_score, e.jug_score, e.sf_score]
+        } else {
+            [e.jug_score, e.sf_score, e.clrsrc_score]
+        };
+        e.score = mirror.into_iter().find(|&s| s != EXP_SCORE_NONE).unwrap_or(0);
+        out.push(e);
+    }
+    out
+}
+
+/// Write entries as a sorted JBK2 main file (header flag SORTED). Entries are sorted defensively
+/// by (key, packed_move); `build_timestamp` is the current wall clock.
+pub fn write_sorted_main(path: &str, entries: &[ExpEntry]) -> std::io::Result<()> {
+    let mut sorted: Vec<&ExpEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.key.cmp(&b.key).then(a.packed_move.cmp(&b.packed_move)));
+    let mut buf = Vec::with_capacity(JBK2_HEADER_SIZE + sorted.len() * JBK2_ENTRY_SIZE);
+    let mut hdr = [0u8; JBK2_HEADER_SIZE];
+    hdr[0..4].copy_from_slice(JBK2_MAGIC);
+    hdr[4..6].copy_from_slice(&2u16.to_le_bytes());
+    hdr[6..8].copy_from_slice(&JBK2_HEADER_FLAG_SORTED.to_le_bytes());
+    hdr[8..16].copy_from_slice(&(sorted.len() as u64).to_le_bytes());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    hdr[16..24].copy_from_slice(&ts.to_le_bytes());
+    buf.extend_from_slice(&hdr);
+    for e in sorted {
+        buf.extend_from_slice(&e.to_bytes());
+    }
+    // Atomic-ish: write to a temp file then rename over the target.
+    let tmp = format!("{}.tmp", path);
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Append-only writer for a JBK2 overlay file (`<exp>.overlay`). The engine pushes its deep
+/// search judgments here; the overlay is merged into the main book offline by `expmerge`.
+/// Kept fully separate from the read-only `ExpBook` so learning never mutates the shipped book.
+/// The overlay is unsorted (header flags = 0); `expmerge` sorts on merge.
+pub struct OverlayWriter {
+    path: String,
+    pending: Vec<ExpEntry>,
+    on_disk: u64, // entries already persisted to the file (from its header)
+}
+
+impl OverlayWriter {
+    /// Open (do not yet create) an overlay at `path`. Reads the existing entry count from the
+    /// header if a valid overlay is already there, so subsequent flushes append rather than clobber.
+    pub fn open(path: &str) -> OverlayWriter {
+        let on_disk = match std::fs::read(path) {
+            Ok(raw) if raw.len() >= JBK2_HEADER_SIZE && &raw[0..4] == JBK2_MAGIC => {
+                u64::from_le_bytes(raw[8..16].try_into().unwrap())
+            }
+            _ => 0,
+        };
+        OverlayWriter { path: path.to_string(), pending: Vec::new(), on_disk }
+    }
+
+    pub fn push(&mut self, e: ExpEntry) {
+        self.pending.push(e);
+    }
+
+    /// Append all pending entries to disk: create the file with a JBK2 header if missing,
+    /// append the entries, then update the header's entry_count. Returns the number flushed.
+    pub fn flush(&mut self) -> usize {
+        if self.pending.is_empty() {
+            return 0;
+        }
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&self.path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("info string exp overlay open failed: {}", e);
+                return 0;
+            }
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < JBK2_HEADER_SIZE as u64 {
+            // Fresh file: write a 32-byte JBK2 header. flags = OVERLAY (unsorted, append-only).
+            let mut hdr = [0u8; JBK2_HEADER_SIZE];
+            hdr[0..4].copy_from_slice(JBK2_MAGIC);
+            hdr[4..6].copy_from_slice(&2u16.to_le_bytes()); // version
+            hdr[6..8].copy_from_slice(&JBK2_HEADER_FLAG_OVERLAY.to_le_bytes());
+            // bytes 8..16 entry_count (set below), 16..24 build_timestamp, 24..32 reserved=0
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            hdr[16..24].copy_from_slice(&ts.to_le_bytes());
+            if f.write_all(&hdr).is_err() {
+                eprintln!("info string exp overlay header write failed");
+                return 0;
+            }
+            self.on_disk = 0;
+        }
+        if f.seek(SeekFrom::End(0)).is_err() {
+            return 0;
+        }
+        let n = self.pending.len();
+        for e in self.pending.drain(..) {
+            if f.write_all(&e.to_bytes()).is_err() {
+                eprintln!("info string exp overlay entry write failed");
+                break;
+            }
+        }
+        self.on_disk += n as u64;
+        if f.seek(SeekFrom::Start(8)).is_ok() {
+            let _ = f.write_all(&self.on_disk.to_le_bytes());
+        }
+        let _ = f.flush();
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polyglot_hash_startpos_vector() {
+        let pos = Position::startpos();
+        assert_eq!(polyglot_hash(&pos), 0x463B96181691FC9C);
+    }
+
+    #[test]
+    fn encode_kingside_castle_vector() {
+        // e1->h1 (king captures own rook) = to h1 (file 7, rank 0), from e1 (file 4, rank 0).
+        let mv = Move::new(sq(4, 0), sq(6, 0), Move::FLAG_KING_CASTLE);
+        assert_eq!(encode_poly_move(mv), 0x0107);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        // Lookup tables are normally initialized in main(); do it here for the unit test.
+        crate::zobrist::init();
+        crate::magic::init();
+        crate::attacks::init();
+        // startpos, both-side castling, and positions with promotions available.
+        let fens = [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1",
+            "r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R b KQkq - 0 1",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1", // pawns on 2nd/7th: quiet + capture promos
+        ];
+        for fen in fens {
+            let mut pos = Position::from_fen(fen).unwrap();
+            let mut list = MoveList::new();
+            movegen::generate_legal(&mut pos, &mut list);
+            assert!(list.len > 0, "no legal moves in {}", fen);
+            for i in 0..list.len {
+                let mv = list.moves[i];
+                let raw = encode_poly_move(mv);
+                let decoded = decode_poly_move(&mut pos, raw);
+                assert!(
+                    decoded == Some(mv),
+                    "roundtrip mismatch for {} (raw {:#06x}) in {}: got {:?}",
+                    mv.to_uci(),
+                    raw,
+                    fen,
+                    decoded.map(|m| m.to_uci())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expmerge_matches_golden_fixture() {
+        // Byte-conformance against the jugernaut reference merge (exp_v2::merge_with).
+        // Fixture lives in the chess_engine tree; skip cleanly if not present here.
+        let dir = r"P:\Projekte\chess_engine\postfach\fixtures";
+        let book_p = format!(r"{}\merge_golden_book.bin", dir);
+        let overlay_p = format!(r"{}\merge_golden_overlay.bin", dir);
+        let expected_p = format!(r"{}\merge_golden_expected.bin", dir);
+        let (book, overlay, expected) = match (
+            ExpBook::load(&book_p),
+            ExpBook::load(&overlay_p),
+            std::fs::read(&expected_p),
+        ) {
+            (Some(b), Some(o), Ok(e)) => (b, o, e),
+            _ => {
+                eprintln!("golden fixture not present, skipping conformance test");
+                return;
+            }
+        };
+        let mut combined = book.all_entries();
+        combined.extend(overlay.all_entries());
+        // Fixture uses jugernaut.book priority (jug-first mirror).
+        let merged = merge_entries(&combined, false);
+
+        let out_p = std::env::temp_dir().join("clrsrc_expmerge_golden.bin");
+        let out_s = out_p.to_str().unwrap();
+        write_sorted_main(out_s, &merged).unwrap();
+        let mut got = std::fs::read(out_s).unwrap();
+        let _ = std::fs::remove_file(&out_p);
+
+        let mut want = expected;
+        // Zero the non-deterministic build_timestamp (header offset 16..24) on both sides.
+        for buf in [&mut got, &mut want] {
+            if buf.len() >= 24 {
+                for b in &mut buf[16..24] {
+                    *b = 0;
+                }
+            }
+        }
+        assert_eq!(got.len(), want.len(), "merged size differs from golden");
+        assert_eq!(got, want, "merged bytes differ from golden fixture");
+    }
+
+    #[test]
+    fn overlay_writer_append_and_count() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("clrsrc_test_overlay.bin");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().unwrap();
+
+        let mk = |key: u64| ExpEntry {
+            key,
+            packed_move: 0x0107,
+            score: 25,
+            depth: 20,
+            count: 1,
+            source: EXP_SOURCE_ENGINE,
+            flags: EXP_FLAG_VALIDATED,
+            wdl_w: 0,
+            wdl_l: 0,
+            nnue_eval: EXP_SCORE_NONE,
+            jug_score: EXP_SCORE_NONE,
+            sf_score: EXP_SCORE_NONE,
+            clrsrc_score: 25,
+        };
+
+        // First flush creates the file with header + 2 entries.
+        let mut w = OverlayWriter::open(p);
+        w.push(mk(10));
+        w.push(mk(20));
+        assert_eq!(w.flush(), 2);
+        assert_eq!(w.flush(), 0); // nothing pending
+
+        // Re-open appends (does not clobber): 2 existing + 1 new = 3.
+        let mut w2 = OverlayWriter::open(p);
+        w2.push(mk(30));
+        assert_eq!(w2.flush(), 1);
+
+        // Read back via the standard reader: header count must be 3, keys present.
+        let book = ExpBook::load(p).expect("overlay loads as JBK2");
+        assert_eq!(book.entry_count(), 3);
+        let mut pos = Position::startpos();
+        // entries are unsorted in an overlay, but ExpBook::load does not re-sort; find_first
+        // relies on sorted order, so just assert the raw count + first entry here.
+        let _ = &mut pos;
+        assert_eq!(book.entry(0).key, 10);
+        assert_eq!(book.entry(2).key, 30);
+        assert_eq!(book.entry(0).source, EXP_SOURCE_ENGINE);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exp_entry_roundtrip() {
+        let e = ExpEntry {
+            key: 0x463B96181691FC9C,
+            packed_move: 0x0795,
+            score: -123,
+            depth: 27,
+            count: 65535,
+            source: 0b0000_1011,
+            flags: 0x01,
+            wdl_w: 12,
+            wdl_l: 7,
+            nnue_eval: i16::MIN,
+            jug_score: -123,
+            sf_score: 456,
+            clrsrc_score: 88,
+        };
+        let bytes = e.to_bytes();
+        let d = ExpEntry::from_bytes(&bytes);
+        assert_eq!(d.key, e.key);
+        assert_eq!(d.packed_move, e.packed_move);
+        assert_eq!(d.score, e.score);
+        assert_eq!(d.depth, e.depth);
+        assert_eq!(d.count, e.count);
+        assert_eq!(d.source, e.source);
+        assert_eq!(d.flags, e.flags);
+        assert_eq!(d.wdl_w, e.wdl_w);
+        assert_eq!(d.wdl_l, e.wdl_l);
+        assert_eq!(d.nnue_eval, e.nnue_eval);
+        assert_eq!(d.jug_score, e.jug_score);
+        assert_eq!(d.sf_score, e.sf_score);
+        assert_eq!(d.clrsrc_score, e.clrsrc_score);
+    }
+
+    #[test]
+    fn exp_book_load_search_and_version_reject() {
+        let dir = std::env::temp_dir();
+        let good = dir.join("clrsrc_test_good.book");
+        let bad = dir.join("clrsrc_test_bad.book");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(JBK2_MAGIC);
+        buf.extend_from_slice(&2u16.to_le_bytes()); // version
+        buf.extend_from_slice(&1u16.to_le_bytes()); // flags SORTED
+        buf.extend_from_slice(&1u64.to_le_bytes()); // entry_count
+        buf.extend_from_slice(&0u64.to_le_bytes()); // timestamp
+        buf.extend_from_slice(&0u64.to_le_bytes()); // reserved
+        let e = ExpEntry {
+            key: 7, packed_move: 0x0795, score: 10, depth: 5, count: 3,
+            source: 1, flags: 0, wdl_w: 0, wdl_l: 0,
+            nnue_eval: EXP_SCORE_NONE, jug_score: EXP_SCORE_NONE, sf_score: EXP_SCORE_NONE,
+            clrsrc_score: EXP_SCORE_NONE,
+        };
+        buf.extend_from_slice(&e.to_bytes());
+        std::fs::write(&good, &buf).unwrap();
+
+        let mut bad_buf = buf.clone();
+        bad_buf[4] = 9; // version 9 -> must be rejected
+        std::fs::write(&bad, &bad_buf).unwrap();
+
+        let gb = ExpBook::load(good.to_str().unwrap()).expect("good book loads");
+        assert_eq!(gb.entry_count(), 1);
+        assert_eq!(gb.find_first(7), Some(0));
+        assert_eq!(gb.find_first(8), None);
+        assert_eq!(gb.entry(0).count, 3);
+
+        assert!(ExpBook::load(bad.to_str().unwrap()).is_none());
+
+        let _ = std::fs::remove_file(&good);
+        let _ = std::fs::remove_file(&bad);
+    }
+}
