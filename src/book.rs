@@ -242,10 +242,28 @@ pub fn polyglot_hash(pos: &Position) -> u64 {
         hash ^= POLY_RANDOMS[771];
     }
 
-    // En passant (8 entries at offset 772, indexed by file)
+    // En passant (8 entries at offset 772, indexed by file). Polyglot spec: the ep key is only
+    // mixed when a pawn of the side to move can actually capture on the ep square. clrsrc's
+    // Position::make_move sets ep_square on every double-pawn-push without this check, so without
+    // the gate below clrsrc would hash positions differently from any Polyglot-conformant builder
+    // (e.g. the jugernaut v4 book): the engine would silently miss its own book after every 2-step
+    // pawn push on the main line.
     if pos.ep_square != NO_SQ {
-        let ep_file = file_of(pos.ep_square) as usize;
-        hash ^= POLY_RANDOMS[772 + ep_file];
+        let ep_file = file_of(pos.ep_square) as i32;
+        let captured_rank: i32 = if pos.side == WHITE { 4 } else { 3 };
+        let capturer = make_piece(pos.side, PAWN);
+        let mut capturable = false;
+        if ep_file > 0 {
+            let sq = (captured_rank * 8 + ep_file - 1) as usize;
+            if pos.mailbox[sq] == capturer { capturable = true; }
+        }
+        if !capturable && ep_file < 7 {
+            let sq = (captured_rank * 8 + ep_file + 1) as usize;
+            if pos.mailbox[sq] == capturer { capturable = true; }
+        }
+        if capturable {
+            hash ^= POLY_RANDOMS[772 + ep_file as usize];
+        }
     }
 
     // Turn: Polyglot XORs the turn key when WHITE to move
@@ -354,7 +372,7 @@ impl Book {
 }
 
 /// Decode a Polyglot raw_move (u16) into a clrsrc Move.
-fn decode_poly_move(pos: &mut Position, raw: u16) -> Option<Move> {
+pub fn decode_poly_move(pos: &mut Position, raw: u16) -> Option<Move> {
     let to_file = (raw & 0x07) as u8;
     let to_row = ((raw >> 3) & 0x07) as u8;
     let from_file = ((raw >> 6) & 0x07) as u8;
@@ -459,6 +477,12 @@ pub const EXP_SCORE_NONE: i16 = i16::MIN;
 /// reusing it would silently collide). When this bit is set, `clrsrc_score` (offset 28) is valid.
 /// clrsrc never sets the Jugernaut bit (0x02) and never writes `jug_score`.
 pub const EXP_SOURCE_ENGINE: u8 = 0b0010_0000;
+/// JBK2 §8 source bit3 = SELFPLAY (entry came from an engine self-play game, not human/PGN data).
+/// clrsrc-generated self-play book entries set `SELFPLAY | clrsrc` (0x28), matching the lichess-bot
+/// harvest convention (coordinated with the bot instance 2026-05-27): the cp eval lives in
+/// `clrsrc_score` so it survives `expmerge` (a bare 0x08 entry carries no per-source score).
+#[allow(dead_code)]
+pub const EXP_SOURCE_SELFPLAY: u8 = 0b0000_1000;
 /// JBK2 §7 flags bit0 = VALIDATED (move verified legal / written by a completed search).
 pub const EXP_FLAG_VALIDATED: u8 = 0x01;
 /// JBK2 §7 flags bit4 = MATE_SCORE (the stored `score` is a mate score, not centipawns).

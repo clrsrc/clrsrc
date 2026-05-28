@@ -87,7 +87,7 @@ file. From the command line:
 ```
 $ ./clrsrc
 uci
-id name clrsrc 1.0.1
+id name clrsrc 1.0.2
 ...
 uciok
 ```

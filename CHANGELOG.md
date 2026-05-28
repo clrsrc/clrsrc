@@ -2,6 +2,19 @@
 
 All notable changes to clrsrc are documented here.
 
+## [1.0.2] - 2026-05-28
+
+### Fixed
+- **Polyglot hash en-passant gating.** `book::polyglot_hash` mixed the ep-file key whenever
+  `pos.ep_square != NO_SQ`. `Position::make_move` sets `ep_square` on every double-pawn-push
+  without checking whether a pawn of the side to move can actually capture there, so clrsrc's
+  hash diverged from any Polyglot/JBK2 builder that follows the spec (e.g. the bundled
+  `jugernaut_v4.book`). Effect: after any 2-step pawn push on the main line, the engine
+  silently failed to look up its own book — the experience/book features only worked from
+  positions without a "fresh" ep-square. The hash is now gated on capturable ep, matching
+  the Polyglot specification. `bench` node count is unchanged (2,846,610); 7/7 tests pass
+  including the `polyglot_hash_startpos_vector` regression vector.
+
 ## [1.0.1] - 2026-05-27
 
 ### Fixed
@@ -27,5 +40,6 @@ All notable changes to clrsrc are documented here.
   generated entirely from self-play and freely redistributable under this project's license.
   Published as a release asset; enable it with `ExpFile` + `PlayFromExp` (off by default).
 
+[1.0.2]: https://github.com/clrsrc/clrsrc/releases/tag/v1.0.2
 [1.0.1]: https://github.com/clrsrc/clrsrc/releases/tag/v1.0.1
 [1.0.0]: https://github.com/clrsrc/clrsrc/releases/tag/v1.0.0
