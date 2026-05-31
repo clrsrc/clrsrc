@@ -286,6 +286,9 @@ impl Book {
     /// For very large books (>100MB), still fast since it's a single sequential read.
     pub fn load(path: &str) -> Option<Book> {
         let data = std::fs::read(path).ok()?;
+        // Polyglot entries are exactly 16 bytes; a non-multiple length means a truncated
+        // file and the trailing partial entry is silently dropped by this division.
+        debug_assert!(data.len() % 16 == 0, "Polyglot book {} has a truncated trailing entry", path);
         let num_entries = data.len() / 16;
         eprintln!("book: opened {} ({} entries)", path, num_entries);
         Some(Book { data, num_entries })
@@ -481,7 +484,7 @@ pub const EXP_SOURCE_ENGINE: u8 = 0b0010_0000;
 /// clrsrc-generated self-play book entries set `SELFPLAY | clrsrc` (0x28), matching the lichess-bot
 /// harvest convention (coordinated with the bot instance 2026-05-27): the cp eval lives in
 /// `clrsrc_score` so it survives `expmerge` (a bare 0x08 entry carries no per-source score).
-#[allow(dead_code)]
+#[allow(dead_code)] // consumed only by the working-tree self-play book tooling (not shipped)
 pub const EXP_SOURCE_SELFPLAY: u8 = 0b0000_1000;
 /// JBK2 §7 flags bit0 = VALIDATED (move verified legal / written by a completed search).
 pub const EXP_FLAG_VALIDATED: u8 = 0x01;
@@ -557,6 +560,7 @@ impl ExpEntry {
 pub struct ExpBook {
     data: Vec<u8>, // entries region only (header stripped)
     num_entries: usize,
+    sorted: bool, // header SORTED flag — find_first/probe require this; false for overlays
 }
 
 impl ExpBook {
@@ -572,12 +576,18 @@ impl ExpBook {
             eprintln!("info string exp: unsupported JBK2 version {} (expected 2)", version);
             return None;
         }
+        let flags = u16::from_le_bytes(raw[6..8].try_into().unwrap());
+        let sorted = flags & JBK2_HEADER_FLAG_SORTED != 0;
         let declared = u64::from_le_bytes(raw[8..16].try_into().unwrap()) as usize;
         let avail = (raw.len() - JBK2_HEADER_SIZE) / JBK2_ENTRY_SIZE;
         let num_entries = declared.min(avail);
         let data = raw[JBK2_HEADER_SIZE..JBK2_HEADER_SIZE + num_entries * JBK2_ENTRY_SIZE].to_vec();
-        eprintln!("info string exp: opened {} ({} entries, v{})", path, num_entries, version);
-        Some(ExpBook { data, num_entries })
+        eprintln!(
+            "info string exp: opened {} ({} entries, v{}, {})",
+            path, num_entries, version,
+            if sorted { "sorted" } else { "OVERLAY/unsorted" }
+        );
+        Some(ExpBook { data, num_entries, sorted })
     }
 
     pub fn entry_count(&self) -> usize {
@@ -603,6 +613,18 @@ impl ExpBook {
 
     /// First index whose key == `key`, or None.
     fn find_first(&self, key: u64) -> Option<usize> {
+        // Binary search requires sorted entries. An overlay (OVERLAY flag, append-only,
+        // unsorted) probed directly would yield silently wrong/missing hits. Refuse it and
+        // warn once rather than return garbage — merge overlays into a sorted main
+        // (write_sorted_main) before probing.
+        if !self.sorted {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("info string exp: WARNING probe on unsorted OVERLAY — no book moves used; merge into a sorted main first");
+            }
+            return None;
+        }
         let mut lo = 0usize;
         let mut hi = self.num_entries;
         while lo < hi {
@@ -1026,6 +1048,48 @@ mod tests {
         assert_eq!(book.entry(0).key, 10);
         assert_eq!(book.entry(2).key, 30);
         assert_eq!(book.entry(0).source, EXP_SOURCE_ENGINE);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn probe_on_unsorted_overlay_bails() {
+        // Regression guard: an overlay (OVERLAY flag, unsorted) must NOT be probed via
+        // binary search. Even with an entry keyed to the probed position, probe() must
+        // return nothing (find_first bails on !sorted) rather than yield a wrong/missing
+        // hit. Overlays are meant to be merged into a sorted main before probing.
+        let dir = std::env::temp_dir();
+        let path = dir.join("clrsrc_test_overlay_probe.bin");
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().unwrap();
+
+        let pos = Position::startpos();
+        let mut w = OverlayWriter::open(p);
+        w.push(ExpEntry {
+            key: polyglot_hash(&pos),
+            packed_move: 0x0107,
+            score: 25,
+            depth: 20,
+            count: 1,
+            source: EXP_SOURCE_ENGINE,
+            flags: EXP_FLAG_VALIDATED,
+            wdl_w: 9,
+            wdl_l: 0,
+            nnue_eval: EXP_SCORE_NONE,
+            jug_score: EXP_SCORE_NONE,
+            sf_score: EXP_SCORE_NONE,
+            clrsrc_score: 25,
+        });
+        w.flush();
+
+        let book = ExpBook::load(p).expect("overlay loads as JBK2");
+        assert!(!book.sorted, "overlay must be flagged unsorted");
+        assert_eq!(book.entry_count(), 1);
+        // The key matches, but probe must bail because the book is unsorted.
+        assert!(
+            book.probe(&pos).is_empty(),
+            "probe on an unsorted overlay must return nothing, not a wrong hit"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

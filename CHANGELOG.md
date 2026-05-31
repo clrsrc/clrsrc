@@ -2,6 +2,36 @@
 
 All notable changes to clrsrc are documented here.
 
+## [1.1.0] - 2026-05-31
+
+### Added
+- **Embedded library API (`[lib]` target).** clrsrc now builds as both the UCI binary and a
+  Rust library, exposing an in-process search facade so a host (e.g. a Lichess bot) can run
+  clrsrc without the UCI subprocess protocol and hand it the host's authoritative wall-clock as
+  the search deadline. New: `EmbeddedEngine` (`init`, `nnue_loaded`, `search_position`),
+  `EmbeddedConfig`, `EmbeddedLimits`, `SearchOutcome`, and `TimeManager::with_deadline`. The
+  UCI binary and its behaviour are **unchanged** — the embedded path is purely additive. See
+  [`EMBEDDED.md`](EMBEDDED.md). Reference consumer: the AGPL-3.0 LiRu-Bot (`--features embedded`).
+
+### Performance
+- **Incremental NNUE update fusion.** `update_inc` now folds `parent − removed (+ removed2) + added`
+  into a single pass (`vec_add_sub` / `vec_add_sub_sub`) instead of copy-then-subtract-then-add.
+  Bit-identical evaluation (i16-wrapping is associative), so the `bench` node count is unchanged
+  (2,846,610) — this is free search speed (~+6–9% NPS), not a strength change.
+
+### Fixed
+- **`go nodes <N>` ignored the node limit.** The default-depth-10 fallback did not check
+  `tc.nodes`, so `go nodes N` without a time control was capped at depth 10 and the node limit
+  was silently dropped. Node-limited searches now run to the requested node count.
+- **Search-thread panic dropped the NNUE.** If the search thread panicked, the join handler
+  installed a placeholder `SearchInfo` with no NNUE, so the rest of the game ran on classical
+  eval (~−200 Elo) with no visible error. The placeholder now retains the NNUE and the panic is
+  reported on stderr.
+
+### Internal
+- Removed an unused `CorrectionHistory` update path (material/continuation tables were updated
+  every quiet node but never read) — pure CPU/cache savings, `bench` node count unchanged.
+
 ## [1.0.2] - 2026-05-28
 
 ### Fixed

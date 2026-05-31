@@ -40,7 +40,7 @@ The [Releases](../../releases) page provides:
 
 | Artifact | Description |
 |----------|-------------|
-| `clrsrc.exe` | Windows x86-64 binary (build it yourself for best performance — see below) |
+| `clrsrc-1.1.0-windows-x86_64.exe` | Windows x86-64 binary — portable build (`x86-64-v2` baseline + runtime AVX2/AVX-512 dispatch for the NNUE); build from source with `target-cpu=native` for a small extra speed-up |
 | `clrsrc_v32_seed_b.nnue` | The trained evaluation network |
 | `jugernaut_v4.book` | Opening / experience book in JBK2 format (optional — see below) |
 
@@ -74,6 +74,12 @@ inner loop, which is a large NPS win over a generic build.
 
 Requirements: a recent stable Rust toolchain (see [rustup.rs](https://rustup.rs)).
 
+**Embedded library.** clrsrc also builds as a Rust library (`[lib]`), exposing an
+in-process search facade so a host program can run the engine without the UCI
+subprocess protocol. This is purely additive — the UCI binary and its behaviour are
+unchanged. See [`EMBEDDED.md`](EMBEDDED.md) for the API contract and the license
+implications of linking clrsrc (GPL-3.0) into another program.
+
 ---
 
 ## Usage
@@ -87,7 +93,7 @@ file. From the command line:
 ```
 $ ./clrsrc
 uci
-id name clrsrc 1.0.2
+id name clrsrc 1.1.0
 ...
 uciok
 ```

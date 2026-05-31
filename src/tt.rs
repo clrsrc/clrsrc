@@ -88,7 +88,15 @@ impl TTable {
         let num_buckets = if raw_buckets.is_power_of_two() {
             raw_buckets
         } else {
-            raw_buckets.next_power_of_two() >> 1
+            // Bucket count must be a power of two for mask indexing, so round DOWN.
+            // Warn loudly: a non-power-of-two Hash silently wastes up to ~50% otherwise.
+            let rounded = (raw_buckets.next_power_of_two() >> 1).max(1);
+            let used_mb = rounded * bucket_bytes / (1024 * 1024);
+            eprintln!(
+                "info string TT: Hash {} MB uses only {} MB ({} MB wasted) — set a power-of-two MB to fill it",
+                mb, used_mb, mb.saturating_sub(used_mb)
+            );
+            rounded
         }.max(1);
         let mut storage = vec![TTBucket::empty(); num_buckets];
         let ptr = storage.as_mut_ptr();

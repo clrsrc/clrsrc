@@ -814,7 +814,58 @@ impl Nnue {
         let h = params.hidden_size;
         let simd = self.simd;
 
-        // Copy parent -> child for both halves (SIMD-friendly memcpy-equivalent)
+        // Fast path: a simple quiet move (1 feature removed, 1 added) fuses the
+        // copy + sub + add 3-pass sequence into a single pass per half. Bit-identical
+        // (same per-lane op order). Quiet moves dominate the tree, so this is the hot case.
+        if delta.n_removed == 1 && delta.n_added == 1 {
+            let (w_rm, b_rm, w_add, b_add) = if params.num_buckets > 1 {
+                let (w_boff, w_flip) = parent.white_kb;
+                let (b_boff, b_flip) = parent.black_kb;
+                let (rw, rb) = delta.removed[0];
+                let (aw, ab) = delta.added[0];
+                (w_boff + (rw ^ w_flip), b_boff + (rb ^ b_flip),
+                 w_boff + (aw ^ w_flip), b_boff + (ab ^ b_flip))
+            } else {
+                let (rw, rb) = delta.removed[0];
+                let (aw, ab) = delta.added[0];
+                (rw, rb, aw, ab)
+            };
+            child.white_kb = parent.white_kb;
+            child.black_kb = parent.black_kb;
+            vec_add_sub_i16(&mut child.white, &parent.white, &params.feature_weights[w_add], &params.feature_weights[w_rm], h, simd);
+            vec_add_sub_i16(&mut child.black, &parent.black, &params.feature_weights[b_add], &params.feature_weights[b_rm], h, simd);
+            child.computed = true;
+            return;
+        }
+
+        // Fast path: a capture (2 removed, 1 added — moving piece's from-square and the
+        // captured piece both leave, the moving piece arrives). Covers plain, en-passant,
+        // and promotion captures. Fuses copy+sub+sub+add into one pass. Bit-identical.
+        if delta.n_removed == 2 && delta.n_added == 1 {
+            let (w_rm0, b_rm0, w_rm1, b_rm1, w_add, b_add) = if params.num_buckets > 1 {
+                let (w_boff, w_flip) = parent.white_kb;
+                let (b_boff, b_flip) = parent.black_kb;
+                let (rw0, rb0) = delta.removed[0];
+                let (rw1, rb1) = delta.removed[1];
+                let (aw, ab) = delta.added[0];
+                (w_boff + (rw0 ^ w_flip), b_boff + (rb0 ^ b_flip),
+                 w_boff + (rw1 ^ w_flip), b_boff + (rb1 ^ b_flip),
+                 w_boff + (aw ^ w_flip), b_boff + (ab ^ b_flip))
+            } else {
+                let (rw0, rb0) = delta.removed[0];
+                let (rw1, rb1) = delta.removed[1];
+                let (aw, ab) = delta.added[0];
+                (rw0, rb0, rw1, rb1, aw, ab)
+            };
+            child.white_kb = parent.white_kb;
+            child.black_kb = parent.black_kb;
+            vec_add_sub_sub_i16(&mut child.white, &parent.white, &params.feature_weights[w_add], &params.feature_weights[w_rm0], &params.feature_weights[w_rm1], h, simd);
+            vec_add_sub_sub_i16(&mut child.black, &parent.black, &params.feature_weights[b_add], &params.feature_weights[b_rm0], &params.feature_weights[b_rm1], h, simd);
+            child.computed = true;
+            return;
+        }
+
+        // General path (castling, double-add cases): copy then apply each feature.
         child.white[..h].copy_from_slice(&parent.white[..h]);
         child.black[..h].copy_from_slice(&parent.black[..h]);
 
@@ -1015,6 +1066,107 @@ fn vec_sub_i16(dst: &mut [i16], src: &[i16], h: usize, simd: SimdImpl) {
             for j in 0..h { dst[j] -= src[j]; }
         }
     }
+}
+
+/// Fused `dst = parent - rm + add` in a single pass (no copy, no child reload).
+/// Replaces the copy+sub+add 3-pass sequence for a simple quiet move. The op order
+/// (sub then add) mirrors the unfused path's intermediate exactly, so the result —
+/// and any i16 wrapping — is bit-identical.
+#[inline(always)]
+fn vec_add_sub_i16(dst: &mut [i16], parent: &[i16], add: &[i16], rm: &[i16], h: usize, simd: SimdImpl) {
+    debug_assert!(dst.len() >= h && parent.len() >= h && add.len() >= h && rm.len() >= h);
+    match simd {
+        #[cfg(target_arch = "x86_64")]
+        SimdImpl::Avx512 => unsafe { vec_add_sub_i16_avx512(dst, parent, add, rm, h) },
+        #[cfg(target_arch = "x86_64")]
+        SimdImpl::Avx2 => unsafe { vec_add_sub_i16_avx2(dst, parent, add, rm, h) },
+        _ => {
+            for j in 0..h { dst[j] = parent[j] - rm[j] + add[j]; }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn vec_add_sub_i16_avx512(dst: &mut [i16], parent: &[i16], add: &[i16], rm: &[i16], h: usize) {
+    use std::arch::x86_64::*;
+    let chunks = h / 32;
+    for c in 0..chunks {
+        let off = c * 32;
+        let p = _mm512_loadu_si512(parent.as_ptr().add(off) as *const _);
+        let r = _mm512_loadu_si512(rm.as_ptr().add(off) as *const _);
+        let a = _mm512_loadu_si512(add.as_ptr().add(off) as *const _);
+        let res = _mm512_add_epi16(_mm512_sub_epi16(p, r), a);
+        _mm512_storeu_si512(dst.as_mut_ptr().add(off) as *mut _, res);
+    }
+    for j in (chunks * 32)..h { dst[j] = parent[j] - rm[j] + add[j]; }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_add_sub_i16_avx2(dst: &mut [i16], parent: &[i16], add: &[i16], rm: &[i16], h: usize) {
+    use std::arch::x86_64::*;
+    let chunks = h / 16;
+    for c in 0..chunks {
+        let off = c * 16;
+        let p = _mm256_loadu_si256(parent.as_ptr().add(off) as *const _);
+        let r = _mm256_loadu_si256(rm.as_ptr().add(off) as *const _);
+        let a = _mm256_loadu_si256(add.as_ptr().add(off) as *const _);
+        let res = _mm256_add_epi16(_mm256_sub_epi16(p, r), a);
+        _mm256_storeu_si256(dst.as_mut_ptr().add(off) as *mut _, res);
+    }
+    for j in (chunks * 16)..h { dst[j] = parent[j] - rm[j] + add[j]; }
+}
+
+/// Fused `dst = parent - rm0 - rm1 + add` in a single pass (capture: moving piece's
+/// from-square + the captured piece both removed, moving piece's to-square added).
+/// Same op order as the unfused copy+sub+sub+add path, so bit-identical.
+#[inline(always)]
+fn vec_add_sub_sub_i16(dst: &mut [i16], parent: &[i16], add: &[i16], rm0: &[i16], rm1: &[i16], h: usize, simd: SimdImpl) {
+    debug_assert!(dst.len() >= h && parent.len() >= h && add.len() >= h && rm0.len() >= h && rm1.len() >= h);
+    match simd {
+        #[cfg(target_arch = "x86_64")]
+        SimdImpl::Avx512 => unsafe { vec_add_sub_sub_i16_avx512(dst, parent, add, rm0, rm1, h) },
+        #[cfg(target_arch = "x86_64")]
+        SimdImpl::Avx2 => unsafe { vec_add_sub_sub_i16_avx2(dst, parent, add, rm0, rm1, h) },
+        _ => {
+            for j in 0..h { dst[j] = parent[j] - rm0[j] - rm1[j] + add[j]; }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn vec_add_sub_sub_i16_avx512(dst: &mut [i16], parent: &[i16], add: &[i16], rm0: &[i16], rm1: &[i16], h: usize) {
+    use std::arch::x86_64::*;
+    let chunks = h / 32;
+    for c in 0..chunks {
+        let off = c * 32;
+        let p = _mm512_loadu_si512(parent.as_ptr().add(off) as *const _);
+        let r0 = _mm512_loadu_si512(rm0.as_ptr().add(off) as *const _);
+        let r1 = _mm512_loadu_si512(rm1.as_ptr().add(off) as *const _);
+        let a = _mm512_loadu_si512(add.as_ptr().add(off) as *const _);
+        let res = _mm512_add_epi16(_mm512_sub_epi16(_mm512_sub_epi16(p, r0), r1), a);
+        _mm512_storeu_si512(dst.as_mut_ptr().add(off) as *mut _, res);
+    }
+    for j in (chunks * 32)..h { dst[j] = parent[j] - rm0[j] - rm1[j] + add[j]; }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vec_add_sub_sub_i16_avx2(dst: &mut [i16], parent: &[i16], add: &[i16], rm0: &[i16], rm1: &[i16], h: usize) {
+    use std::arch::x86_64::*;
+    let chunks = h / 16;
+    for c in 0..chunks {
+        let off = c * 16;
+        let p = _mm256_loadu_si256(parent.as_ptr().add(off) as *const _);
+        let r0 = _mm256_loadu_si256(rm0.as_ptr().add(off) as *const _);
+        let r1 = _mm256_loadu_si256(rm1.as_ptr().add(off) as *const _);
+        let a = _mm256_loadu_si256(add.as_ptr().add(off) as *const _);
+        let res = _mm256_add_epi16(_mm256_sub_epi16(_mm256_sub_epi16(p, r0), r1), a);
+        _mm256_storeu_si256(dst.as_mut_ptr().add(off) as *mut _, res);
+    }
+    for j in (chunks * 16)..h { dst[j] = parent[j] - rm0[j] - rm1[j] + add[j]; }
 }
 
 #[cfg(target_arch = "x86_64")]

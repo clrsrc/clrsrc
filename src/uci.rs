@@ -66,7 +66,7 @@ pub fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                println!("id name clrsrc 1.0.2");
+                println!("id name clrsrc 1.1.0");
                 println!("id author clrsrc contributors");
                 println!("option name Hash type spin default 64 min 1 max 65536");
                 println!("option name Threads type spin default 1 min 1 max 256");
@@ -108,8 +108,6 @@ pub fn uci_loop() {
                 info.cont_history_2.clear();
                 info.capture_history.clear();
                 info.correction_history.clear();
-                info.material_correction.clear();
-                info.cont_correction.clear();
                 info.hash_history.clear();
                 info.game_history_len = 0;
                 game_ply = 0;
@@ -119,11 +117,22 @@ pub fn uci_loop() {
                 info.game_history_len = info.hash_history.len();
             }
             "go" => {
-                // Wait for any previous search to finish
+                // Wait for any previous search to finish.
+                // Ordering assumption: `info = ret_info` here restores the searching
+                // thread's info and OVERWRITES anything written to `info` since it was
+                // spawned. So a `position` must be preceded by a `stop`/`ponderhit` (which
+                // joins first) — the non-standard `go ponder → position → go` would lose the
+                // hash_history that `position` wrote onto the placeholder. GUIs follow the
+                // standard order, so this is a documented coupling, not a live bug.
                 if let Some(handle) = search_handle.take() {
                     time::set_stop(true);
                     if let Ok((_, ret_info, _)) = handle.join() {
                         info = ret_info;
+                    } else {
+                        // Search thread panicked. `info` is the placeholder, which already
+                        // carries an NNUE clone (see below), so eval stays correct; warn so
+                        // the panic is visible rather than silently degrading.
+                        eprintln!("info string WARNING: search thread panicked; NNUE preserved, search state reset");
                     }
                 }
 
@@ -192,8 +201,15 @@ pub fn uci_loop() {
                 let learn_min_depth = exp_min_depth;
                 let learn_is_ponder = is_ponder;
 
-                // Move full info (including NNUE) into thread; create fresh placeholder
-                let mut thread_info = std::mem::replace(&mut info, SearchInfo::new(Arc::clone(&tt)));
+                // Move full info (including NNUE) into thread; create fresh placeholder.
+                // Give the placeholder a cheap Arc-clone of the loaded NNUE so that if the
+                // search thread panics (handle.join() => Err), subsequent moves still evaluate
+                // with NNUE instead of silently falling back to classical eval (~-200 ELO,
+                // invisible). hash_history/game_history_len are refreshed by the next `position`
+                // command; learned tables rebuild — only the once-loaded NNUE is unrecoverable.
+                let mut placeholder = SearchInfo::new(Arc::clone(&tt));
+                placeholder.nnue = info.nnue.clone();
+                let mut thread_info = std::mem::replace(&mut info, placeholder);
                 search_handle = Some(thread::spawn(move || {
                     let mut search_pos = Position::from_fen(&fen).unwrap();
                     // Initialize NNUE accumulator
@@ -332,6 +348,8 @@ pub fn uci_loop() {
                 if let Some(handle) = search_handle.take() {
                     if let Ok((_, ret_info, _)) = handle.join() {
                         info = ret_info;
+                    } else {
+                        eprintln!("info string WARNING: search thread panicked; NNUE preserved, search state reset");
                     }
                 }
             }
@@ -358,6 +376,11 @@ pub fn uci_loop() {
                 println!("Eval: {} cp", crate::eval::evaluate(&pos));
             }
             "verify" => {
+                // verify_engine runs real searches over `info`, the global STOP flag, and
+                // the shared TT. A live background search would collide on all three (and
+                // verify would run on the placeholder info), so assert none is in flight.
+                // (`eval` above needs no such guard — it is a pure static evaluate(&pos).)
+                debug_assert!(search_handle.is_none(), "verify issued while a search is in flight");
                 verify_engine(&mut info, &book, best_book_move);
             }
             "quit" => {
@@ -591,7 +614,7 @@ fn parse_go(tokens: &[&str]) -> (TimeControl, bool) {
         i += 1;
     }
 
-    if !tc.infinite && tc.depth == 0 && tc.movetime == 0 && tc.wtime == 0 && tc.btime == 0 && !is_ponder {
+    if !tc.infinite && tc.depth == 0 && tc.nodes == 0 && tc.movetime == 0 && tc.wtime == 0 && tc.btime == 0 && !is_ponder {
         tc.depth = 10;
     }
 

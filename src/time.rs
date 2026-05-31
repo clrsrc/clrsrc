@@ -85,10 +85,27 @@ pub struct TimeManager {
     score_factor: f64,      // Stash 2^(-Δscore/100), per-iter (NOT accumulated)
     node_tm_factor: f64,    // node-based factor (existing)
     forced_factor: f64,     // Patch B Phase 2: 1 legal=0.01, strong-forced=0.39, weak-forced=0.63, else 1.0
+    max_deadline: Option<Instant>, // C2 (embedded): absolute wall-clock ceiling from the bot.
+                            // None for the UCI path (behaviour unchanged). When Some, it caps the
+                            // computed limits AND is enforced directly in should_stop_hard().
 }
 
 impl TimeManager {
+    /// UCI path — unchanged behaviour (30 ms hardcoded overhead, no deadline).
     pub fn new(tc: &TimeControl, is_white: bool, game_ply: u32) -> Self {
+        Self::build(tc, is_white, game_ply, 30.0, None)
+    }
+
+    /// Embedded path (C2): same form-aware budgeting as `new()`, but the bot's
+    /// absolute wall-clock `max_deadline` is the authoritative hard ceiling, and
+    /// the engine's 30 ms overhead is dropped — the bot already subtracted RTT +
+    /// move_overhead when computing the deadline (single source of truth).
+    #[allow(dead_code)] // used by the embedded lib facade (lib.rs), not the UCI binary
+    pub fn with_deadline(tc: &TimeControl, is_white: bool, game_ply: u32, max_deadline: Instant) -> Self {
+        Self::build(tc, is_white, game_ply, 0.0, Some(max_deadline))
+    }
+
+    fn build(tc: &TimeControl, is_white: bool, game_ply: u32, move_overhead_in: f64, max_deadline: Option<Instant>) -> Self {
         let mut tm = TimeManager {
             start: Instant::now(),
             base_soft_limit_ms: i64::MAX,
@@ -106,6 +123,7 @@ impl TimeManager {
             score_factor: 1.0,
             node_tm_factor: 1.0,
             forced_factor: 1.0,
+            max_deadline,
         };
 
         if tc.infinite || tc.depth > 0 {
@@ -129,8 +147,9 @@ impl TimeManager {
 
         // Stockfish-style time manager init (Modus B port from chess_engines/top/stockfish/src/src/timeman.cpp).
         // Log-scaled constants → caps grow with log10(time): tight at TC 10+0.1, generous at TC 60+0.6 / Lichess-Rapid.
-        // Move overhead: 30 ms safety buffer (hardcoded; future: UCI MoveOverhead option).
-        let move_overhead: f64 = 30.0;
+        // Move overhead: UCI path passes 30 ms safety buffer; embedded path passes 0
+        // (the bot's deadline already accounts for RTT + overhead).
+        let move_overhead: f64 = move_overhead_in;
 
         // Move horizon: ≤50 moves until next TC. Below 1 s scale mtg down so timeLeft stays positive.
         let mut mtg: i64 = if tc.movestogo > 0 {
@@ -207,6 +226,19 @@ impl TimeManager {
         tm.base_soft_limit_ms = tm.soft_limit_ms;
         tm.base_hard_limit_ms = tm.hard_limit_ms;
 
+        // C2 (embedded): cap the form-aware budget by the bot's absolute deadline.
+        // "min(clrsrc_computed_hard, max_deadline - start)" — clrsrc keeps inc-amortisation,
+        // stability & phase logic, but the bot's knowledge of the real remaining time is the
+        // upper bound. Cap the BASE so the factor system (apply_factors) never exceeds it.
+        if let Some(dl) = tm.max_deadline {
+            let budget = dl.saturating_duration_since(tm.start).as_millis() as i64;
+            let cap = budget.max(1);
+            tm.hard_limit_ms = tm.hard_limit_ms.min(cap);
+            tm.soft_limit_ms = tm.soft_limit_ms.min(tm.hard_limit_ms);
+            tm.base_hard_limit_ms = tm.hard_limit_ms;
+            tm.base_soft_limit_ms = tm.soft_limit_ms;
+        }
+
         tm
     }
 
@@ -228,6 +260,11 @@ impl TimeManager {
         // `is_pondering` is false and the clock keeps running from `go ponder`, so ponder time
         // counts against the budget — total wall time is bounded by hard_limit, never over-allocating.
         if is_pondering() { return false; }
+        // C2 (embedded): absolute wall-clock ceiling. Enforced directly so it also bounds
+        // infinite/depth-mode embedded searches, independent of the computed hard_limit_ms.
+        if let Some(dl) = self.max_deadline {
+            if Instant::now() >= dl { return true; }
+        }
         if self.max_nodes > 0 && nodes >= self.max_nodes {
             return true;
         }

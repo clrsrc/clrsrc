@@ -67,8 +67,6 @@ pub struct SearchInfo {
     pub cont_history_2: ContHistory,
     pub capture_history: CaptureHistory,
     pub correction_history: CorrectionHistory,
-    pub material_correction: CorrectionHistory,
-    pub cont_correction: CorrectionHistory,
     pub pv: [[Move; MAX_PLY]; MAX_PLY],
     pub pv_len: [usize; MAX_PLY],
     pub seldepth: i32,
@@ -76,7 +74,6 @@ pub struct SearchInfo {
     pub eval_stack: [i32; MAX_PLY],
     pub move_stack: [Move; MAX_PLY],
     pub piece_stack: [PieceType; MAX_PLY],
-    pub double_ext: [i32; MAX_PLY],
     pub reduction_stack: [i32; MAX_PLY],
     // NNUE
     pub nnue: Nnue,
@@ -86,6 +83,11 @@ pub struct SearchInfo {
     pub game_history_len: usize, // length of game history (before search starts)
     // Datagen support
     pub silent: bool,
+    // Output gate (embedded lib): when false, suppress the stdout UCI info lines
+    // WITHOUT changing search behaviour. Distinct from `silent`, which also skips
+    // the root TB probe and routes node counts through the SMP helper counter.
+    // UCI default true (prints as before); the embedded engine sets it false.
+    pub print_info: bool,
     pub root_score: i32,
     // Deepest fully-completed iterative-deepening depth this search (0 if none).
     // Used by the experience-learning write path (uci.rs) as the save-depth gate.
@@ -120,21 +122,19 @@ impl SearchInfo {
             cont_history_2: ContHistory::new(),
             capture_history: CaptureHistory::new(),
             correction_history: CorrectionHistory::new(),
-            material_correction: CorrectionHistory::new(),
-            cont_correction: CorrectionHistory::new(),
             pv: [[Move::NULL; MAX_PLY]; MAX_PLY],
             pv_len: [0; MAX_PLY],
             seldepth: 0,
             eval_stack: [0; MAX_PLY],
             move_stack: [Move::NULL; MAX_PLY],
             piece_stack: [PieceType::None; MAX_PLY],
-            double_ext: [0; MAX_PLY],
             reduction_stack: [0; MAX_PLY],
             nnue: Nnue::new(),
             acc_stack,
             hash_history: Vec::with_capacity(512),
             game_history_len: 0,
             silent: false,
+            print_info: true,
             root_score: 0,
             completed_depth: 0,
             best_move_nodes: 0,
@@ -168,7 +168,6 @@ impl SearchInfo {
             self.eval_stack[i] = 0;
             self.move_stack[i] = Move::NULL;
             self.piece_stack[i] = PieceType::None;
-            self.double_ext[i] = 0;
             self.reduction_stack[i] = 0;
         }
     }
@@ -228,26 +227,6 @@ fn is_repetition(info: &SearchInfo, hash: u64, halfmove_clock: u16) -> bool {
     false
 }
 
-/// Compute a material key from piece counts (for material correction history)
-#[inline]
-fn material_key(pos: &Position) -> u64 {
-    let mut key: u64 = 0;
-    for color in 0..2 {
-        for pt in 0..6 {
-            let count = crate::bitboard::popcount(pos.pieces[pt] & pos.colors[color]) as u64;
-            // Deterministic mix: unique multiplier per (color, pt) slot
-            key ^= count.wrapping_mul(0x9E3779B97F4A7C15u64.wrapping_mul((color * 6 + pt) as u64 + 1));
-        }
-    }
-    key
-}
-
-/// Compute a key for continuation correction history from previous move
-#[inline]
-fn cont_corr_key(prev_pt: PieceType, prev_to: Square) -> u64 {
-    (prev_pt.index() as u64 * 64 + prev_to as u64).wrapping_mul(0x9E3779B97F4A7C15u64)
-}
-
 /// Evaluate position using NNUE if loaded, otherwise HCE
 #[inline]
 fn evaluate_pos(pos: &Position, info: &SearchInfo, ply: usize) -> i32 {
@@ -273,7 +252,7 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
     let mut best_move = Move::NULL;
     let mut best_score = -INFINITY;
 
-    if !info.silent {
+    if !info.silent && info.print_info {
         let tt_entries = info.tt.entry_count();
         let tt_mb = tt_entries * 16 / (1024 * 1024);
         println!("info string TT: {} entries ({}MB), hashfull at start: {}", tt_entries, tt_mb, info.tt.hashfull());
@@ -296,19 +275,21 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
                 info.pv_len[0] = 1;
                 info.root_score = tb_score;
 
-                let elapsed = tm.elapsed_ms().max(1);
-                print!("info depth 1 seldepth 1 score ");
-                if is_mate_score(tb_score) {
-                    let mate_in = if tb_score > 0 {
-                        (MATE_SCORE - tb_score + 1) / 2
+                if info.print_info {
+                    let elapsed = tm.elapsed_ms().max(1);
+                    print!("info depth 1 seldepth 1 score ");
+                    if is_mate_score(tb_score) {
+                        let mate_in = if tb_score > 0 {
+                            (MATE_SCORE - tb_score + 1) / 2
+                        } else {
+                            -(MATE_SCORE + tb_score + 1) / 2
+                        };
+                        print!("mate {} ", mate_in);
                     } else {
-                        -(MATE_SCORE + tb_score + 1) / 2
-                    };
-                    print!("mate {} ", mate_in);
-                } else {
-                    print!("cp 0 ");
+                        print!("cp 0 ");
+                    }
+                    println!("nodes 1 nps 0 hashfull 0 tbhits 1 time {} pv {}", elapsed, mv_uci);
                 }
-                println!("nodes 1 nps 0 hashfull 0 tbhits 1 time {} pv {}", elapsed, mv_uci);
                 return parsed;
             }
         }
@@ -334,8 +315,8 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
             best_move = info.pv[0][0];
         }
 
-        // Print UCI info (unless silent mode for datagen)
-        if !info.silent {
+        // Print UCI info (unless silent mode for datagen, or print_info off for embedded)
+        if !info.silent && info.print_info {
             let elapsed = tm.elapsed_ms().max(1);
             // Include helper-thread nodes for honest UCI nps under SMP.
             let total_nodes = info.nodes
@@ -884,9 +865,6 @@ fn pvs(
             }
         }
 
-        // Check if this move gives check (used for LMR adjustment)
-        let gives_check = pos.is_in_check();
-
         moves_searched += 1;
 
         // Track quiet moves for history penalty on cutoff
@@ -909,11 +887,6 @@ fn pvs(
         info.move_stack[ply_u] = mv;
         info.piece_stack[ply_u] = moved_pt;
 
-        // Double extension tracking for child nodes
-        if ply_u + 1 < MAX_PLY {
-            info.double_ext[ply_u + 1] = info.double_ext[ply_u] + if extension == 2 { 1 } else { 0 };
-        }
-
         let new_depth = depth - 1 + extension;
         let mut score;
 
@@ -922,6 +895,9 @@ fn pvs(
 
         // LMR: Late Move Reductions (quiets only)
         if moves_searched > 3 && depth >= 3 && is_quiet_move && !in_check {
+            // gives_check is only consumed here, so the king-attack scan is deferred
+            // into the LMR gate — skipped for first moves, captures, and depth < 3.
+            let gives_check = pos.is_in_check();
             let r = lmr_reduction(depth, moves_searched, is_pv, tt_pv, improving, hist_score, cut_node, static_eval, alpha, gives_check);
             let reduced_depth = (new_depth - r).max(1);
             score = -pvs(pos, info, tm, -alpha - 1, -alpha, reduced_depth, ply + 1, false, Move::NULL, !cut_node);
@@ -1071,11 +1047,6 @@ fn pvs(
         if !in_check && !is_mate_score(best_score) && raw_eval != -INFINITY {
             let diff = best_score - raw_eval;
             info.correction_history.update(pos.side, pos.pawn_hash, diff, depth);
-            info.material_correction.update(pos.side, material_key(pos), diff, depth);
-            if ply > 0 && prev_pt != PieceType::None {
-                let ck = cont_corr_key(prev_pt, prev_to);
-                info.cont_correction.update(pos.side, ck, diff, depth);
-            }
         }
     }
 
