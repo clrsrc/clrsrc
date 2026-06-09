@@ -364,9 +364,20 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
             tm.update_forced(info.root_moves_count, eval_diff);
         }
 
-        // Stop if we found mate
+        // Stop if we found mate — but only once a WINNING mate has been verified.
+        // A mate score appearing at shallow depth from a warm TT entry is unverified and
+        // may encode a non-progressing / repeating move → instant depth-1 shuffle into a
+        // draw (uEn2qBri R+N+4P vs K). TB-wins and losing mates exit immediately as before;
+        // the time manager bounds the extra search for long winning mates.
         if is_mate_score(best_score) {
-            break;
+            if best_score < MATE_IN_MAX {
+                break; // TB-win or losing decisive score → exit as before
+            }
+            let mate_plies = MATE_SCORE - best_score; // halfmoves until we deliver mate
+            if depth >= mate_plies {
+                break; // winning mate fully verified at this nominal depth
+            }
+            // else: keep deepening to verify the mate and pick a progressing move
         }
     }
 
@@ -436,8 +447,19 @@ fn pvs(
     // Check extension (limit relative to nominal depth to avoid search explosion)
     if in_check && ply < depth as i32 + 16 { depth += 1; }
 
-    // Quiescence at leaf
+    // Quiescence at leaf — but draw-detect FIRST. A depth<=0 node dropping straight into
+    // quiescence lets a warm-TT mate entry return without a repetition/50-move check,
+    // producing an instant depth-1 mate-bound shuffle into a 3-fold draw from a won
+    // position (lPG7cqDO: Q+5P vs K — long mate where the depth>=mate_plies guard is
+    // unreachable, so matefix's ID-break never fires). Mirrors the depth>=1 draw
+    // detection below. See [[bug_tt_matt_shuffle_depth0]].
     if depth <= 0 {
+        if pos.halfmove_clock >= 100 {
+            return contempt_draw_score(pos);
+        }
+        if !is_root && is_repetition(info, pos.hash, pos.halfmove_clock) {
+            return contempt_draw_score(pos);
+        }
         return quiescence(pos, info, tm, alpha, beta, ply);
     }
 
@@ -567,12 +589,9 @@ fn pvs(
     // Improving: is our static eval better than 2 plies ago?
     let improving = !in_check && ply >= 2 && static_eval > info.eval_stack[ply_u - 2];
 
-    // ---- IIR: Internal Iterative Reduction ----
-    if tt_move == Move::NULL && depth >= 4 && !in_check {
-        depth -= 1;
-    }
-
     // ---- Pre-move Pruning (non-PV, not in check, not excluded for SE) ----
+    // IIR moved AFTER this block (late-IIR, +55.9 Elo SPRT 09.06): the pruning
+    // gates below (RFP/NMP/Razoring/ProbCut) now see the FULL depth.
     if !is_pv && !in_check && excluded == Move::NULL {
         // Reverse Futility Pruning (margin adjusts with improving)
         let rfp_margin = if improving { tune::get(&tune::RFP_MARGIN_IMP) } else { tune::get(&tune::RFP_MARGIN_NIMP) };
@@ -617,7 +636,7 @@ fn pvs(
 
             if info.stopped || time::should_stop() { return 0; }
             if score >= beta {
-                return beta;
+                return if is_mate_score(score) { beta } else { score };
             }
         }
 
@@ -695,6 +714,13 @@ fn pvs(
                 }
             }
         }
+    }
+
+    // ---- IIR: Internal Iterative Reduction (late: applied AFTER pruning gates) ----
+    // +55.9 Elo SPRT 09.06 vs early-IIR. Reduces only the move-loop search depth
+    // (LMP/futility/LMR); the pruning gates above used the full depth.
+    if tt_move == Move::NULL && depth >= 4 && !in_check {
+        depth -= 1;
     }
 
     // ---- Move Generation + Ordering ----
@@ -1121,9 +1147,10 @@ fn quiescence(
 
     if !in_check {
         if stand_pat >= beta {
-            return beta;
+            return stand_pat;
         }
     }
+    let mut best_score = stand_pat;
     let old_alpha = alpha;
     if stand_pat > alpha {
         alpha = stand_pat;
@@ -1233,11 +1260,14 @@ fn quiescence(
         if score >= beta {
             // Store TT entry for beta cutoff
             info.tt.store(pos.hash, 0, FLAG_LOWER, beta - old_alpha > 1, score_to_tt(score, ply), stand_pat as i16, mv);
-            return beta;
+            return score;
         }
-        if score > alpha {
-            alpha = score;
+        if score > best_score {
+            best_score = score;
             best_qs_move = mv;
+            if score > alpha {
+                alpha = score;
+            }
         }
     }
 
@@ -1247,11 +1277,11 @@ fn quiescence(
     }
 
     // Store TT entry
-    let qs_flag = if alpha > old_alpha { FLAG_EXACT } else { FLAG_UPPER };
+    let qs_flag = if best_score > old_alpha { FLAG_EXACT } else { FLAG_UPPER };
     let eval_store = if in_check { 0i16 } else { stand_pat as i16 };
-    info.tt.store(pos.hash, 0, qs_flag, beta - old_alpha > 1, score_to_tt(alpha, ply), eval_store, best_qs_move);
+    info.tt.store(pos.hash, 0, qs_flag, beta - old_alpha > 1, score_to_tt(best_score, ply), eval_store, best_qs_move);
 
-    alpha
+    best_score
 }
 
 /// Pre-computed LMR reduction table: LMR_TABLE[depth][moves_searched]

@@ -403,7 +403,7 @@ pub fn run_datagen(num_games: u32, soft_nodes: u64, output_path: &str, num_threa
             let mut nnue_found = false;
             let exe_dir = std::env::current_exe().ok()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            for name in &["clrsrc_v16_kb4.nnue", "clrsrc_v11.nnue", "clrsrc.nnue"] {
+            for name in &["clrsrc_v32_seed_b.nnue", "clrsrc_v16_kb4.nnue", "clrsrc_v11.nnue", "clrsrc.nnue"] {
                 let candidates: Vec<std::path::PathBuf> = {
                     let mut v = vec![std::path::PathBuf::from(name)];
                     if let Some(ref dir) = exe_dir {
@@ -468,8 +468,10 @@ pub fn run_datagen(num_games: u32, soft_nodes: u64, output_path: &str, num_threa
                     local_buf.extend_from_slice(entry);
                 }
 
-                // Flush to shared writer every 10 games (200K nodes = slow games)
-                if (local_game + 1) % 10 == 0 || local_game + 1 == my_games {
+                // Flush to shared writer every game — minimises buffered-data loss on
+                // crash/reboot for slow single-producer datagen (1M soft_nodes). Lock
+                // overhead per game is negligible vs multi-second searches.
+                if local_buf.len() >= 32 {
                     if !local_buf.is_empty() {
                         let mut w = writer.lock().unwrap();
                         w.write_all(&local_buf).expect("Failed to write");

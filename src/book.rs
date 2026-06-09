@@ -484,7 +484,6 @@ pub const EXP_SOURCE_ENGINE: u8 = 0b0010_0000;
 /// clrsrc-generated self-play book entries set `SELFPLAY | clrsrc` (0x28), matching the lichess-bot
 /// harvest convention (coordinated with the bot instance 2026-05-27): the cp eval lives in
 /// `clrsrc_score` so it survives `expmerge` (a bare 0x08 entry carries no per-source score).
-#[allow(dead_code)] // consumed only by the working-tree self-play book tooling (not shipped)
 pub const EXP_SOURCE_SELFPLAY: u8 = 0b0000_1000;
 /// JBK2 §7 flags bit0 = VALIDATED (move verified legal / written by a completed search).
 pub const EXP_FLAG_VALIDATED: u8 = 0x01;
@@ -675,16 +674,76 @@ impl ExpBook {
             _ => best_score,
         };
         let in_cutoff: Vec<&ExpEntry> = entries.iter().filter(|e| e.score >= cutoff).collect();
-        // WDL filter: require loss-rate < 50% once we have a meaningful sample.
+        // WDL quality filter — opening-book hygiene. Three fixes over the old
+        // `total<6 || loss*2<total+2`, which let a 0-win queen-hang ride the small-sample grace
+        // while wrongly filtering established Black mainlines:
+        //  (A) the small-sample grace no longer shelters net-losing moves;
+        //  (B) the mature test is *sibling-relative*, not an absolute 50% win-rate — WDL stores no
+        //      draws, so a sound Black defense scores <50% among decisive games and must not be cut;
+        //  (C) an un-evaluated entry (no engine judgment) that has never won but has lost is dropped
+        //      from the random pool even at a single loss — neither eval nor record can vouch for it.
+        const WDL_MIN_SAMPLE: i32 = 6;   // below this a move is "unproven"
+        const WDL_BAR_SAMPLE: i32 = 20;  // only well-sampled siblings set the comparison bar
+        // An entry carries a real engine judgment only via jug/sf/nnue (sentinel EXP_SCORE_NONE)
+        // or clrsrc_score — and the latter is valid ONLY when source & EXP_SOURCE_ENGINE
+        // (otherwise it is the default 0, NOT an eval). Pure-harvest entries have none of these.
+        let has_eval = |e: &ExpEntry| {
+            e.jug_score != EXP_SCORE_NONE
+                || e.sf_score != EXP_SCORE_NONE
+                || e.nnue_eval != EXP_SCORE_NONE
+                || (e.source & EXP_SOURCE_ENGINE != 0 && e.clrsrc_score != EXP_SCORE_NONE)
+        };
+        let win_rate = |e: &ExpEntry| {
+            let t = e.wdl_w as i32 + e.wdl_l as i32;
+            e.wdl_w as f32 / t as f32
+        };
+        let best_wr = in_cutoff
+            .iter()
+            .filter(|e| (e.wdl_w as i32 + e.wdl_l as i32) >= WDL_BAR_SAMPLE)
+            .map(|e| win_rate(e))
+            .fold(f32::NEG_INFINITY, f32::max);
         let wdl_ok: Vec<&ExpEntry> = in_cutoff
             .iter()
             .copied()
             .filter(|e| {
-                let total = e.wdl_w as i32 + e.wdl_l as i32;
-                total < 6 || (e.wdl_l as i32) * 2 < total + 2
+                let (w, l) = (e.wdl_w as i32, e.wdl_l as i32);
+                let total = w + l;
+                if has_eval(e) {
+                    // The score cutoff already vouched for this move; only drop it if a
+                    // well-sampled record proves it clearly worse than the best sibling.
+                    total < WDL_MIN_SAMPLE
+                        || best_wr == f32::NEG_INFINITY
+                        || win_rate(e) >= best_wr - 0.15
+                } else {
+                    // No eval at all: the WDL record is the only signal we have.
+                    if w == 0 && l >= 1 {
+                        false // (C) never won, has lost → never randomly played
+                    } else if total < WDL_MIN_SAMPLE {
+                        w >= l // (A) unproven: keep only if not net-losing
+                    } else if best_wr == f32::NEG_INFINITY {
+                        w * 3 >= total // no well-sampled bar: lenient ≥33%-wins floor
+                    } else {
+                        win_rate(e) >= best_wr - 0.15 // (B) sibling-relative
+                    }
+                }
             })
             .collect();
-        let pool = if wdl_ok.is_empty() { in_cutoff } else { wdl_ok };
+        // Fallback must NOT re-admit filtered junk (the old `in_cutoff` fallback silently bypassed
+        // every gate). If nothing survives, play the single safest deterministic-best move instead.
+        let pool = if wdl_ok.is_empty() {
+            let best = in_cutoff
+                .iter()
+                .max_by(|a, b| {
+                    a.depth
+                        .cmp(&b.depth)
+                        .then(a.count.cmp(&b.count))
+                        .then(a.score.cmp(&b.score))
+                })
+                .unwrap();
+            return decode_poly_move(pos, best.packed_move);
+        } else {
+            wdl_ok
+        };
 
         if eff_variety == 0 {
             // Deterministic best.

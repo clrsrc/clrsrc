@@ -40,12 +40,14 @@ The [Releases](../../releases) page provides:
 
 | Artifact | Description |
 |----------|-------------|
-| `clrsrc-1.1.0-windows-x86_64.exe` | Windows x86-64 binary — portable build (`x86-64-v2` baseline + runtime AVX2/AVX-512 dispatch for the NNUE); build from source with `target-cpu=native` for a small extra speed-up |
-| `clrsrc_v32_seed_b.nnue` | The trained evaluation network |
+| `clrsrc-1.1.1-windows-x86_64.exe` | Windows x86-64 binary — **self-contained** (the NNUE is embedded); portable build (`x86-64-v2` baseline + runtime AVX2/AVX-512 dispatch for the NNUE); build from source with `target-cpu=native` for a small extra speed-up |
+| `clrsrc_v32_seed_b.nnue` | The trained evaluation network (optional — already embedded in the binary; only needed to override `EvalFile`) |
 | `jugernaut_v4.book` | Opening / experience book in JBK2 format (optional — see below) |
 
-Place the `.nnue` file next to the executable (it is the default `EvalFile`),
-or point the `EvalFile` UCI option at it.
+The default network is **embedded in the binary** (since 1.1.1), so the bare
+executable plays at full strength with nothing else in the folder. To run a
+*different* network, point the `EvalFile` UCI option at a `.nnue` file (this
+overrides the embedded net).
 
 **Opening book.** clrsrc now ships an opening/experience book,
 `jugernaut_v4.book` (~192k positions, JBK2 v2 format). It was generated entirely
@@ -87,13 +89,14 @@ implications of linking clrsrc (GPL-3.0) into another program.
 clrsrc speaks [UCI](https://en.wikipedia.org/wiki/Universal_Chess_Interface),
 so it works with any UCI GUI (Cute Chess, Arena, BanksiaGUI, en-croissant, …).
 
-Point your GUI at the `clrsrc` executable and set `EvalFile` to the `.nnue`
-file. From the command line:
+Just point your GUI at the `clrsrc` executable — the NNUE is embedded, so no
+further setup is needed (set `EvalFile` only if you want a different network).
+From the command line:
 
 ```
 $ ./clrsrc
 uci
-id name clrsrc 1.1.0
+id name clrsrc 1.1.1
 ...
 uciok
 ```
@@ -104,7 +107,7 @@ uciok
 |--------|---------|---------|
 | `Hash` | 64 | Transposition-table size in MB |
 | `Threads` | 1 | Search threads (Lazy SMP) |
-| `EvalFile` | — | Path to the NNUE file |
+| `EvalFile` | *(embedded)* | Path to an NNUE file to use instead of the embedded default |
 | `OwnBook` | false | Use a Polyglot opening book |
 | `BookFile` | — | Path to the Polyglot `.bin` book |
 | `BestBookMove` | true | Pick the highest-weighted book move (vs. weighted-random) |

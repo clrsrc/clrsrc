@@ -44,7 +44,7 @@ tunable!(SEE_CAP_MUL, 100, 50, 200);
 
 // LMR
 tunable!(LMR_HIST_DIV, 5120, 2048, 10240);
-tunable!(LMR_DIVISOR, 175, 125, 300);     // scaled x100; base divisor in ln(d)*ln(m)/div formula
+tunable!(LMR_DIVISOR, 137, 125, 300);     // scaled x100; base divisor in ln(d)*ln(m)/div formula. SPSA 175->137 + Confirm-SPRT @TC30+0.3 04.06 (9262g, +3.6 Elo, kein Bound aber konsistent positiv)
 
 // Aspiration Window
 tunable!(ASP_DELTA, 21, 10, 50);          // SPSA v2: 25→21 (-34.9 ELO)
@@ -96,7 +96,7 @@ pub fn all_params() -> Vec<TuneParam> {
         TuneParam { name: "SEE_QUIET_MUL", param: &SEE_QUIET_MUL, default: 42, min: 20, max: 100 },
         TuneParam { name: "SEE_CAP_MUL", param: &SEE_CAP_MUL, default: 100, min: 50, max: 200 },
         TuneParam { name: "LMR_HIST_DIV", param: &LMR_HIST_DIV, default: 5120, min: 2048, max: 10240 },
-        TuneParam { name: "LMR_DIVISOR", param: &LMR_DIVISOR, default: 175, min: 125, max: 300 },
+        TuneParam { name: "LMR_DIVISOR", param: &LMR_DIVISOR, default: 137, min: 125, max: 300 },
         TuneParam { name: "ASP_DELTA", param: &ASP_DELTA, default: 21, min: 10, max: 50 },
         TuneParam { name: "PROBCUT_MARGIN", param: &PROBCUT_MARGIN, default: 80, min: 50, max: 200 },
         TuneParam { name: "PROBCUT_DEPTH", param: &PROBCUT_DEPTH, default: 5, min: 3, max: 8 },

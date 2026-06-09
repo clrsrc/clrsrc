@@ -347,10 +347,22 @@ impl Nnue {
     /// L2: size = H * (768*2 + 2 + 2*L2*2 + 2*L2/H + 2/H) ... (complex)
     pub fn load(&mut self, path: &str) -> Result<(), String> {
         let data = std::fs::read(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
+        self.load_bytes(data.as_slice(), path)
+    }
+
+    /// Load the embedded default network (clrsrc_v32_seed_b) so the release binary
+    /// is self-contained (no external EvalFile needed; EvalFile still overrides).
+    pub fn load_embedded(&mut self) -> Result<(), String> {
+        static EMBEDDED_NNUE: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/clrsrc_v32_seed_b.nnue"));
+        self.load_bytes(EMBEDDED_NNUE, "<embedded clrsrc_v32_seed_b>")
+    }
+
+    /// Parse + load a network from raw bytes (format auto-detected by header/size).
+    fn load_bytes(&mut self, data: &[u8], path: &str) -> Result<(), String> {
 
         // Try CLNN header first
         if data.len() >= 4 && &data[0..4] == b"CLNN" {
-            return self.load_clnn(&data, path);
+            return self.load_clnn(data, path);
         }
 
         // Auto-detect hidden size for single-layer: size = H * 1542 + 2 (+ padding)
@@ -363,7 +375,7 @@ impl Nnue {
                 if h > MAX_HIDDEN {
                     return Err(format!("Hidden size {} exceeds MAX_HIDDEN {}", h, MAX_HIDDEN));
                 }
-                return self.load_bullet_single_dynamic(&data, path, h);
+                return self.load_bullet_single_dynamic(data, path, h);
             }
         }
 
@@ -377,7 +389,7 @@ impl Nnue {
                     if h > MAX_HIDDEN || b > MAX_BUCKETS {
                         return Err(format!("H={} or B={} exceeds limits", h, b));
                     }
-                    return self.load_bullet_bucketed(&data, path, h, b);
+                    return self.load_bullet_bucketed(data, path, h, b);
                 }
             }
         }
@@ -394,7 +406,7 @@ impl Nnue {
                     if h > MAX_HIDDEN || b > MAX_BUCKETS {
                         return Err(format!("H={} or B={} exceeds limits", h, b));
                     }
-                    return self.load_bullet_outbucket(&data, path, h, b);
+                    return self.load_bullet_outbucket(data, path, h, b);
                 }
             }
         }
@@ -409,7 +421,7 @@ impl Nnue {
                     if h > MAX_HIDDEN || b > MAX_BUCKETS {
                         return Err(format!("H={} or B={} exceeds limits", h, b));
                     }
-                    return self.load_bullet_threats_bucketed(&data, path, h, b);
+                    return self.load_bullet_threats_bucketed(data, path, h, b);
                 }
             }
         }
@@ -424,7 +436,7 @@ impl Nnue {
                 if h > MAX_HIDDEN {
                     return Err(format!("Hidden size {} exceeds MAX_HIDDEN {}", h, MAX_HIDDEN));
                 }
-                return self.load_bullet_l2(&data, path, h);
+                return self.load_bullet_l2(data, path, h);
             }
         }
 

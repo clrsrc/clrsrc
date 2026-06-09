@@ -222,6 +222,24 @@ impl TimeManager {
             tm.soft_limit_ms = tm.soft_limit_ms.min(tm.hard_limit_ms);
         }
 
+        // Low-time cap (Patch C, 28.05): below 60 s remaining the natural max still
+        // lets the engine spend > 50 % of the clock on one move (game AgHuraju vs
+        // matmoi 2013, 3+2: 28 s of a 47 s budget → outoftime).
+        // Sister regime of patch-A-v2 (cap above 60 s).
+        // Cap shape: `time * 0.15 + inc`. The `+ inc` term fixes v1's (19.05)
+        // SPRT-reject reason "factor 0.15 too tight, no inc-amortization":
+        //   time =  5s, inc=2s →  2.75 s cap
+        //   time = 30s, inc=2s →  6.50 s cap
+        //   time = 60s, inc=2s → 11.00 s cap
+        // REQUIRES SPRT before VServer-deploy: v1 full-range 0.15 lost
+        // −23.9 ELO at Blitz 3+2. If Blitz mid-game regresses, narrow the
+        // threshold (e.g. time ≤ 30 000) or raise the factor (0.20–0.25).
+        if time > 0 && time <= 60_000 {
+            let low_time_cap = ((time as f64) * 0.15 + (inc as f64)) as i64;
+            tm.hard_limit_ms = tm.hard_limit_ms.min(low_time_cap.max(50));
+            tm.soft_limit_ms = tm.soft_limit_ms.min(tm.hard_limit_ms);
+        }
+
         // Capture bases for Patch B factor recomputation (post patch-A-v2 cap).
         tm.base_soft_limit_ms = tm.soft_limit_ms;
         tm.base_hard_limit_ms = tm.hard_limit_ms;
@@ -280,8 +298,20 @@ impl TimeManager {
         let total = self.stability_factor * self.score_factor * self.node_tm_factor * self.forced_factor;
         let scaled_hard = (self.base_hard_limit_ms as f64 * total) as i64;
         self.hard_limit_ms = scaled_hard.min(self.base_hard_limit_ms).max(1);
+        // Cap how far the SOFT limit (the "start a new iteration" gate) may inflate above its
+        // base. stability_factor (up to 2.50× while the best move keeps changing) is meant to
+        // grant more time when a *better* move was just found — but in dead-flat positions
+        // (eval ≈ 0.0, many near-equal root moves) the best move oscillates as noise, pinning
+        // stability at 2.50× and ballooning soft from ~40s toward the ~158s hard cap. On slower
+        // hardware the engine is still in that oscillation phase when the inflated budget lets it
+        // launch one more very deep iteration → 126s on a single quiet move (Lichess EqGn5ie6,
+        // Rapid 600+5). HARD is left untouched (a running iteration may finish); only the
+        // start-new-iteration budget is bounded. Invisible at fast TC / fast HW (the BM
+        // stabilises before the budget binds), so this is an SPRT-at-Rapid-TC change. Tunable.
+        const SOFT_INFLATION_CAP: f64 = 1.50;
+        let soft_ceiling = (self.base_soft_limit_ms as f64 * SOFT_INFLATION_CAP) as i64;
         let scaled_soft = (self.base_soft_limit_ms as f64 * total) as i64;
-        self.soft_limit_ms = scaled_soft.min(self.hard_limit_ms).max(1);
+        self.soft_limit_ms = scaled_soft.min(soft_ceiling).min(self.hard_limit_ms).max(1);
     }
 
     /// Update forced-move factor after each ID iteration.

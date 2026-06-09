@@ -2,6 +2,35 @@
 
 All notable changes to clrsrc are documented here.
 
+## [1.1.1] - 2026-06-09
+
+### Added
+- **Self-contained binary — embedded NNUE.** The default network (`clrsrc_v32_seed_b`) is now
+  embedded into the executable via `include_bytes!`, so the bare `clrsrc.exe` plays at full NNUE
+  strength with no external `EvalFile` and no `.nnue` file in the working directory.
+  `setoption name EvalFile value <path>` still overrides the embedded net (e.g. for net A/B
+  testing); `clrsrc bench` falls back to the embedded net when no file is present.
+
+### Changed
+- **Fail-soft PVS.** The search now returns the best score actually found rather than clamping to
+  the alpha/beta window, with the accompanying pruning adjustments. This changes the search tree:
+  the `bench` node count is now **1,352,208** (was 2,846,610).
+- **Late Internal Iterative Reduction (IIR).** IIR is applied *after* the pre-move pruning gates
+  (reverse-futility / null-move / razoring / ProbCut), so those gates evaluate at the full,
+  un-reduced depth; only the move-loop search is reduced. +55.9 ± 18.9 Elo in self-play SPRT
+  (10+0.1, H1 accepted).
+- **LMR tuning.** `LMR_DIVISOR` 175 → 137 (SPSA-tuned). Time-manager and transposition-table
+  refinements; search stability multipliers.
+
+### Fixed
+- **Mate-distance early-exit (matefix).** Iterative deepening no longer breaks as soon as *any*
+  mate score appears; a winning mate is accepted only once `depth >= mate_plies`, so the engine
+  converges on the shortest mate instead of shuffling a won position. +48.4 Elo in self-play SPRT
+  — a warm-TT depth-1 mate cut-off had been costing broad points (three-fold draws in won games).
+- **Leaf draw detection (repfix).** The `depth <= 0` leaf now applies the same 50-move and
+  repetition draw detection as the interior `depth >= 1` path before dropping into quiescence,
+  fixing a long-mate → three-fold-repetition class in won endgames.
+
 ## [1.1.0] - 2026-05-31
 
 ### Added
@@ -70,6 +99,8 @@ All notable changes to clrsrc are documented here.
   generated entirely from self-play and freely redistributable under this project's license.
   Published as a release asset; enable it with `ExpFile` + `PlayFromExp` (off by default).
 
+[1.1.1]: https://github.com/clrsrc/clrsrc/releases/tag/v1.1.1
+[1.1.0]: https://github.com/clrsrc/clrsrc/releases/tag/v1.1.0
 [1.0.2]: https://github.com/clrsrc/clrsrc/releases/tag/v1.0.2
 [1.0.1]: https://github.com/clrsrc/clrsrc/releases/tag/v1.0.1
 [1.0.0]: https://github.com/clrsrc/clrsrc/releases/tag/v1.0.0

@@ -14,6 +14,7 @@ mod search;
 mod time;
 mod book;
 mod datagen;
+mod selfplaybook;
 mod tablebase;
 mod tune;
 mod rescore;
@@ -72,8 +73,61 @@ fn main() {
                 let book_path = args.get(6).map(|s| s.as_str());
                 datagen::run_datagen(games, soft_nodes, output, threads, book_path);
             }
+            "genbook" => {
+                // clrsrc self-play book generation → JBK2 overlay (source 0x28).
+                // Usage: clrsrc genbook <games> <soft_nodes> <out.overlay> <threads> [diversity_book.bin]
+                //        [--seed-fen "<FEN>"] [--cand-moves a2a3,f1d3,...] [--explore-plies N]
+                // Seeded mode (targeted line): start every game from <FEN>, force one candidate move
+                // at the seed (clean per-move WDL), then HCE-near-best random explore plies + play-out.
+                let games = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1000);
+                let soft_nodes = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(100_000u64);
+                let output = args.get(4).map(|s| s.as_str()).unwrap_or("clrsrc_selfplay.overlay");
+                let threads = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
+
+                // Parse optional flags + a bare positional book path from args[6..].
+                let mut book_path: Option<&str> = None;
+                let mut seed_fen: Option<String> = None;
+                let mut cand_moves_uci: Vec<String> = Vec::new();
+                let mut explore_plies: u32 = 3;
+                let mut i = 6;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--seed-fen" => { seed_fen = args.get(i + 1).cloned(); i += 2; }
+                        "--cand-moves" => {
+                            if let Some(v) = args.get(i + 1) {
+                                cand_moves_uci = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                            }
+                            i += 2;
+                        }
+                        "--explore-plies" => { explore_plies = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(3); i += 2; }
+                        other => { if !other.starts_with("--") { book_path = Some(&args[i]); } i += 1; }
+                    }
+                }
+                let seed = seed_fen.map(|fen| selfplaybook::SeedConfig { fen, cand_moves_uci, explore_plies });
+                selfplaybook::run_genbook(games, soft_nodes, output, threads, book_path, seed);
+            }
+            "bookfens" => {
+                // Mainline FEN extraction for A/B opening sets (count-weighted walk, dedup).
+                // Usage: clrsrc bookfens <samples> <target_ply> <out.epd> <book> [min_count=5]
+                if args.len() < 6 {
+                    eprintln!("usage: clrsrc bookfens <samples> <target_ply> <out.epd> <book> [min_count=5]");
+                    return;
+                }
+                let samples: u32 = args[2].parse().unwrap_or(1000);
+                let target_ply: u32 = args[3].parse().unwrap_or(4);
+                let output = args[4].as_str();
+                let book_path = args[5].as_str();
+                let min_count: u16 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(5);
+                selfplaybook::run_bookfens(samples, target_ply, output, book_path, min_count);
+            }
             "rescore" => {
                 rescore::run(&args[2..]);
+            }
+            "tbrescore" => {
+                rescore::run_tb(&args[2..]);
+            }
+            "egfilter" => {
+                rescore::run_egfilter(&args[2..]);
             }
             "exp" => {
                 let path = args.get(2).map(|s| s.as_str()).unwrap_or("jugernaut_v2.book");
@@ -219,9 +273,15 @@ fn run_bench(depth: i32, nnue_path: &str) {
     let mut info = search::SearchInfo::new(tt);
 
     // Load NNUE so the PGO profile covers the real evaluation hot path.
-    // Fall back to classical eval if the file is missing — bench still runs.
-    match info.nnue.load(nnue_path) {
-        Ok(()) => eprintln!("info string bench: loaded NNUE from {}", nnue_path),
+    // Prefer the external file (dev), else fall back to the embedded net so a
+    // bare binary still benches the real NNUE eval (matches in-game strength).
+    let load_res = if std::path::Path::new(nnue_path).exists() {
+        info.nnue.load(nnue_path).map(|()| nnue_path.to_string())
+    } else {
+        info.nnue.load_embedded().map(|()| "<embedded>".to_string())
+    };
+    match load_res {
+        Ok(src) => eprintln!("info string bench: loaded NNUE from {}", src),
         Err(e) => eprintln!("info string bench: NNUE load failed ({}); using classical eval", e),
     }
 

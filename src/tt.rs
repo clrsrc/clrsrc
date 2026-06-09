@@ -18,6 +18,17 @@ pub const FLAG_WAS_PV: u8 = 0x04;
 
 const BUCKET_SIZE: usize = 2;
 
+// Depth penalty applied per generation of age during probe.
+// Prevents stale TT entries (from earlier ply analyses stored in the TT)
+// from triggering false cutoffs when the same position appears as root.
+// Tuned empirically; SPRT-candidate before any value change.
+// penalty=4 → -15 Elo, penalty=1 → -7 Elo (both regress: tax the common age=1 carry-over).
+// Threshold variant: only age >= TT_AGING_THRESHOLD is aged (age=1 = previous move = bulk-neutral).
+// Aging inert gestellt (age<=255 < 9999) -> verhaltens-clean = Prod 3D8AC150.
+// Threshold-Variante (36f8e198) ist als Binary archiviert, Stefan-geparkt.
+const TT_AGING_THRESHOLD: i32 = 9999;
+const TT_AGING_DEPTH_PENALTY: i32 = 2;
+
 /// Packed TT entry: 16 bytes
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -132,13 +143,23 @@ impl TTable {
     }
 
     /// Probe the TT. Checks both entries in the bucket.
+    /// Entries from older generations get a depth penalty to prevent stale
+    /// shallow entries (cached from earlier ply analyses) from causing false
+    /// cutoffs when they reappear as the root position in a new search.
     pub fn probe(&self, hash: u64) -> Option<TTEntry> {
         let idx = self.bucket_index(hash);
         let key16 = Self::key16(hash);
+        let gen = self.current_gen();
         let bucket = unsafe { &*self.ptr.add(idx) };
         for i in 0..BUCKET_SIZE {
             let e = &bucket.entries[i];
             if e.key16 == key16 && (e.flag & FLAG_TYPE_MASK) != FLAG_NONE {
+                let age = gen.wrapping_sub(e.gen) as i32;
+                if age >= TT_AGING_THRESHOLD {
+                    let mut aged = *e;
+                    aged.depth = (aged.depth as i32 - TT_AGING_DEPTH_PENALTY * age).max(-1) as i8;
+                    return Some(aged);
+                }
                 return Some(*e);
             }
         }

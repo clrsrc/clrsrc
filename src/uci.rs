@@ -21,6 +21,10 @@ pub fn uci_loop() {
     let mut tt = tt::TTable::new_shared(64);
     let mut num_threads: usize = 1;
     let mut info = SearchInfo::new(Arc::clone(&tt));
+    // Self-contained default: load the embedded NNUE so a bare binary plays with
+    // NNUE eval out-of-the-box (CCRL / no EvalFile). A later `setoption EvalFile`
+    // overrides this (e.g. for SPRT net-swaps).
+    let _ = info.nnue.load_embedded();
     let mut game_ply: u32 = 0;
 
     // Book support
@@ -66,7 +70,7 @@ pub fn uci_loop() {
 
         match tokens[0] {
             "uci" => {
-                println!("id name clrsrc 1.1.0");
+                println!("id name clrsrc {}", env!("CARGO_PKG_VERSION"));
                 println!("id author clrsrc contributors");
                 println!("option name Hash type spin default 64 min 1 max 65536");
                 println!("option name Threads type spin default 1 min 1 max 256");
