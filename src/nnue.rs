@@ -37,13 +37,13 @@ const NNUE_SCALE: i32 = 400; // network output → centipawn scaling
 #[rustfmt::skip]
 const BUCKET_LAYOUT_QS: [usize; 32] = [
     0, 0, 1, 1,  // rank 1
-    0, 0, 1, 1,  // rank 2
-    2, 2, 3, 3,  // rank 3
-    2, 2, 3, 3,  // rank 4
-    2, 2, 3, 3,  // rank 5
-    2, 2, 3, 3,  // rank 6
-    2, 2, 3, 3,  // rank 7
-    2, 2, 3, 3,  // rank 8
+    2, 2, 3, 3,  // rank 2
+    4, 4, 5, 5,  // rank 3
+    6, 6, 7, 7,  // rank 4
+    8, 8, 9, 9,  // rank 5
+    10, 10, 11, 11,  // rank 6
+    12, 12, 13, 13,  // rank 7
+    14, 14, 15, 15,  // rank 8
 ];
 
 // Expanded to 64 squares (with horizontal mirroring applied)
@@ -308,7 +308,10 @@ enum SimdImpl {
 
 #[inline]
 fn detect_simd() -> SimdImpl {
-    #[cfg(target_arch = "x86_64")]
+    // not(miri): Miri kann die AVX-Intrinsics nicht interpretieren → skalaren Pfad erzwingen,
+    // damit `cargo miri` (UB-Sweep auf movegen/make-unmake/perft) durchläuft. Die SIMD-fns
+    // werden dann nie ausgeführt (nur kompiliert). Release/Normalbuild unberührt.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         if std::is_x86_feature_detected!("avx512bw") && std::is_x86_feature_detected!("avx512f") {
             return SimdImpl::Avx512;
@@ -543,11 +546,19 @@ impl Nnue {
             off += 2;
         }
 
-        // Output weights: bullet transpose() saves as [NUM_OUTPUT_BUCKETS][2*h] (per-bucket contiguous).
+        // Output weights: bullet affine("l1", 2*h, NUM_OUTPUT_BUCKETS) saved WITHOUT .transpose() is
+        // FEATURE-MAJOR on disk: file[feature*NUM_OUTPUT_BUCKETS + bucket] (bullet blas.rs: aidx = m*ni + mi,
+        // m=feature, mi=bucket). The first NUM_OUTPUT_BUCKETS i16 are ALL buckets' weight for feature 0, etc.
+        // De-interleave into per-bucket-contiguous [bucket][2*h] storage so eval can slice [bucket*2*h .. +2*h].
+        // (Verified 2026-06-14 vs bullet blas.rs + raw-byte dump + per-bucket eval match. The earlier
+        //  "bucket-major" comment was WRONG: Arasan has per-bucket sublayers; here it is ONE affine with 8 outputs.)
         let mut output_weights = vec![0i16; NUM_OUTPUT_BUCKETS * 2 * h];
-        for i in 0..NUM_OUTPUT_BUCKETS * 2 * h {
-            output_weights[i] = i16::from_le_bytes([data[off], data[off + 1]]);
+        for k in 0..NUM_OUTPUT_BUCKETS * 2 * h {
+            let v = i16::from_le_bytes([data[off], data[off + 1]]);
             off += 2;
+            let feature = k / NUM_OUTPUT_BUCKETS;
+            let bucket = k % NUM_OUTPUT_BUCKETS;
+            output_weights[bucket * 2 * h + feature] = v;
         }
 
         let mut output_biases = [0i16; NUM_OUTPUT_BUCKETS];

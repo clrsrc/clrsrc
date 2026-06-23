@@ -22,6 +22,14 @@ pub const MATE_IN_MAX: i32 = MATE_SCORE - MAX_PLY as i32;
 // TB-win scores live in [TB_WIN_IN_MAX, MATE_IN_MAX); pure mate scores in [MATE_IN_MAX, MATE_SCORE].
 // Both ranges are ply-relative and need TT adjustment + UCI mate-display.
 pub const TB_WIN_IN_MAX: i32 = MATE_IN_MAX - MAX_PLY as i32;
+// Node budget for the mate-aware TB-root guard: in a TB-WIN position, search up to this
+// many nodes for a forced mate before falling back to the DTZ move (which may sacrifice
+// material to zero the 50-move clock). A NODE cap (not depth) is the right measure: the
+// material-rich sacrifice cases have SHORT mates found in few nodes (KQRRvK mate-2 = 401
+// nodes, 2R-vs-K mate-10 ≈ 0.6M), while minimal positions (KRvK) have LONG mates that cost
+// millions — there DTZ sacrifices nothing, so capping out to DTZ early is free and avoids a
+// multi-second mate computation. Only active in TB positions → bench-neutral.
+pub const TB_MATE_PROBE_NODES: u64 = 2_000_000;
 
 /// Is this a decisive (mate or TB-win) score?
 fn is_mate_score(score: i32) -> bool {
@@ -36,6 +44,81 @@ fn score_to_tt(score: i32, ply: i32) -> i16 {
         (score - ply) as i16
     } else {
         score as i16
+    }
+}
+
+// ---- Kani formal-verification harnesses (cfg(kani) → build-neutral, Live-Engine unberührt) ----
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    /// Beweist für ALLE gültigen (score, ply): score_to_tt/score_from_tt sind exakt invers
+    /// (Roundtrip) UND der TT-Store erzeugt keinen i16-Overflow (Truncation). Das ist die
+    /// P1-Eigenschaft (TB-Win-Range + ply-Korrektur), die heute nur manuell gegen DefenChess/
+    /// Viri geprüft wurde — Kani macht es exhaustiv über den gesamten Score×Ply-Raum.
+    #[kani::proof]
+    fn score_tt_roundtrip_and_no_overflow() {
+        let score: i32 = kani::any();
+        let ply: i32 = kani::any();
+        kani::assume(score >= -MATE_SCORE && score <= MATE_SCORE); // Engine-Score-Range [-29000,29000]
+        kani::assume(ply >= 0 && ply < MAX_PLY as i32);            // gültige Suchtiefe [0,128)
+        let stored: i16 = score_to_tt(score, ply);                // i16-Store; Kani prüft Overflow
+        let recovered: i32 = score_from_tt(stored, ply);
+        assert_eq!(recovered, score, "TT-Score-Roundtrip muss verlustfrei sein");
+    }
+
+    /// MOVE-ENCODING: beweist für ALLE gültigen (from, to, flags), dass das u16-Packing
+    /// (from[0:6] | to[6:12] | flags[12:16] in Move::new) verlustfrei durch from()/to()/
+    /// flags() zurückgelesen wird. Fängt jede Off-by-one/Maskenverschiebung im Move-Layout
+    /// (die Klasse, die clrsrc beim polyglot-hash-Encoding teuer getroffen hat).
+    #[kani::proof]
+    fn move_pack_roundtrip() {
+        let from: Square = kani::any();
+        let to: Square = kani::any();
+        let flags: u16 = kani::any();
+        kani::assume(from < 64 && to < 64 && flags < 16); // 6-bit Squares + 4-bit Flags
+        let mv = Move::new(from, to, flags);
+        assert_eq!(mv.from(), from,   "Move::from() muss das from-Feld exakt zurückgeben");
+        assert_eq!(mv.to(),   to,     "Move::to() muss das to-Feld exakt zurückgeben");
+        assert_eq!(mv.flags(), flags, "Move::flags() muss das flags-Feld exakt zurückgeben");
+    }
+
+    /// BITBOARD/ARRAY-BOUNDS: beweist, dass die Index-Clamp aus lmr_reduction (search.rs)
+    /// `LMR_TABLE.get_unchecked(d).get_unchecked(m)` für JEDES (depth: i32, moves: u32) —
+    /// auch negatives depth (usize-Wraparound) — in-bounds hält. Verifiziert die SAFETY-
+    /// Annahme des unsafe-Blocks statisch über den gesamten Eingaberaum.
+    #[kani::proof]
+    fn lmr_index_clamp_in_bounds() {
+        let depth: i32 = kani::any();
+        let moves_searched: u32 = kani::any();
+        let d = (depth as usize).min(MAX_PLY - 1);          // exakt search.rs:1382
+        let m = (moves_searched as usize).min(MAX_PLY - 1); // exakt search.rs:1383
+        assert!(d < MAX_PLY, "LMR_TABLE Zeilen-Index out of bounds");
+        assert!(m < MAX_PLY, "LMR_TABLE Spalten-Index out of bounds");
+    }
+
+    /// ZOBRIST: XOR-Involution (h ^ key ^ key == h) = die Hash-Symmetrie, auf der make_move/
+    /// unmake_move beruhen — gilt UNABHÄNGIG von den init()-gefüllten Key-Werten. Plus
+    /// Index-Bound-Sicherheit der Key-Tabellen-Zugriffe (ep_key file<8, piece_key über den
+    /// GÜLTIGEN Vertrag pt<6; NB: PieceType::None=6 wäre OOB → implizite Vorbedingung).
+    #[kani::proof]
+    fn zobrist_xor_involution_and_bounds() {
+        let hash: u64 = kani::any();
+        // ep_key: file in [0,8) (EP_KEYS hat 8 Einträge)
+        let file: u8 = kani::any();
+        kani::assume(file < 8);
+        let ek = crate::zobrist::ep_key(file);
+        assert_eq!(hash ^ ek ^ ek, hash, "ep-Hash: make/unmake muss sich aufheben");
+        // piece_key: echte Figur (pt<6), color<2, sq<64
+        let ci: u8 = kani::any();  kani::assume(ci < 2);
+        let pti: u8 = kani::any(); kani::assume(pti < 6);
+        let sq: Square = kani::any(); kani::assume(sq < 64);
+        let color = if ci == 0 { Color::White } else { Color::Black };
+        let pt = match pti {
+            0 => PieceType::Pawn, 1 => PieceType::Knight, 2 => PieceType::Bishop,
+            3 => PieceType::Rook, 4 => PieceType::Queen, _ => PieceType::King,
+        };
+        let pk = crate::zobrist::piece_key(color, pt, sq);
+        assert_eq!(hash ^ pk ^ pk, hash, "piece-Hash: make/unmake muss sich aufheben");
     }
 }
 
@@ -101,6 +184,10 @@ pub struct SearchInfo {
     pub root_moves_count: u32,
     // Per-search stop flag (avoids global STOP race in multi-threaded datagen)
     pub stopped: bool,
+    // Mate-aware TB-root guard: when true, non-root Syzygy probes are suppressed so the
+    // search computes a true mate distance (not a flat TB-win score) while looking for a
+    // forced mate before falling back to the DTZ move. Set only during that root search.
+    pub suppress_tb: bool,
 }
 
 impl SearchInfo {
@@ -141,6 +228,7 @@ impl SearchInfo {
             root_second_best: i32::MIN,
             root_moves_count: 0,
             stopped: false,
+            suppress_tb: false,
         }
     }
 
@@ -227,15 +315,58 @@ fn is_repetition(info: &SearchInfo, hash: u64, halfmove_clock: u16) -> bool {
     false
 }
 
+/// Gated mop-up / king-herding gradient (Mop-up-Hebel 2, chess_engines #42).
+/// Active ONLY in a pawnless, decisively-winning, bare-ish-king regime (exact material gate
+/// → null normal-play risk). ≤6 Steine deckt Syzygy-DTZ ab; dies füllt die >TB-Lücke, in der
+/// die saturierte NNUE keinen Treib-Gradienten hat. Liefert einen STM-relativen Bonus (0 wenn
+/// Gate nicht erfüllt): treibt den einsamen König an den Rand (Center-Manhattan-Dist) + bringt
+/// den eigenen König nah (K-K-Manhattan). Winzig vs. der Gewinn-Basis → kippt nie das Vorzeichen.
+#[inline]
+fn mopup_term(pos: &Position) -> i32 {
+    if pos.pieces[PAWN.index()] != 0 { return 0; }            // Gate 1: bauernlos
+    const VAL: [i32; 6] = [0, 320, 330, 500, 900, 0];          // P(unused) N B R Q K
+    let mat = |c: Color| -> (i32, u32) {
+        let mut v = 0i32; let mut n = 0u32;
+        for pt in [KNIGHT, BISHOP, ROOK, QUEEN] {
+            let cnt = crate::bitboard::popcount(pos.pieces[pt.index()] & pos.colors[c.index()]);
+            v += cnt as i32 * VAL[pt.index()]; n += cnt;
+        }
+        (v, n)
+    };
+    let stm = pos.side;
+    let (sv, sn) = mat(stm);
+    let (nv, nn) = mat(stm.flip());
+    let winner_is_stm = sv >= nv;
+    let (winv, losv, losn) = if winner_is_stm { (sv, nv, nn) } else { (nv, sv, sn) };
+    // Gate 2: entscheidend gewinnend (Winner ≥ Turm UND ≥ Turm Vorsprung). Gate 3: Verlierer (fast) blank.
+    if winv < 500 || winv - losv < 500 || losn > 1 { return 0; }
+    let winner = if winner_is_stm { stm } else { stm.flip() };
+    let lk = pos.king_sq(winner.flip());                       // Verlierer-König
+    let wk = pos.king_sq(winner);
+    let (lf, lr) = (file_of(lk) as i32, rank_of(lk) as i32);
+    let cmd = (3 - lf).max(lf - 4).max(0) + (3 - lr).max(lr - 4).max(0);   // 0 Zentrum .. 6 Ecke
+    let md = (file_of(wk) as i32 - lf).abs() + (rank_of(wk) as i32 - lr).abs();  // K-K-Manhattan (max 14)
+    let bonus = 5 * cmd + 2 * (14 - md);                       // ≈ CPW 4.7*CMD + 1.6*(14-MD)
+    if winner_is_stm { bonus } else { -bonus }
+}
+
 /// Evaluate position using NNUE if loaded, otherwise HCE
 #[inline]
 fn evaluate_pos(pos: &Position, info: &SearchInfo, ply: usize) -> i32 {
-    if info.nnue.is_loaded() {
+    let e = if info.nnue.is_loaded() {
         let bucket = crate::nnue::output_bucket_for_occupied(crate::bitboard::popcount(pos.occupancy()));
         info.nnue.evaluate(&info.acc_stack[ply], pos.side, bucket)
     } else {
         eval::evaluate(pos)
-    }
+    };
+    // rule50 Eval-Skalierung (7/9-NNUE-Standard; SF skaliert global das Netz-Output).
+    // Die saturierte NNUE sieht den halfmove_clock NICHT → ohne dies überschätzt sie
+    // Stellungen, die in Wahrheit ins 50-Zug-Remis laufen. Linear: hmc=0→×1.0, hmc=100→×0.5.
+    // Greift NUR am Netz-Output `e`, NICHT am Mop-up-Treib-Gradient (der soll bei hohem hmc
+    // voll bleiben, um VOR dem 50-Zug-Remis zu konvertieren).
+    let hmc = (pos.halfmove_clock.min(100)) as i32;
+    let scaled = e * (200 - hmc) / 200;
+    scaled + mopup_term(pos)
 }
 
 /// Iterative deepening entry point
@@ -258,8 +389,14 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
         println!("info string TT: {} entries ({}MB), hashfull at start: {}", tt_entries, tt_mb, info.tt.hashfull());
     }
 
-    // Root TB probe: if in a TB position, play the DTZ-optimal move directly.
+    // Root TB probe: in a TB position the DTZ move is usually best, BUT DTZ only minimises
+    // distance-to-zero, so in piece-only WINs it can sacrifice material to zero the 50-move
+    // clock instead of delivering a present mate (vMB6ei9s: K+Q+R+R vs k — DTZ throws Q then
+    // R; search finds Rb7+ #+2 directly). Mate-aware guard: for WINs, defer — keep the DTZ
+    // move as a fallback and let a depth-capped search look for a forced mate first; only use
+    // DTZ if no winning mate is found. LOSS/DRAW keep the immediate return (search can't improve).
     // Skipped during datagen (silent) so iterative deepening still produces samples.
+    let mut tb_dtz_fallback: Option<(Move, i32)> = None;
     if !info.silent {
         if let Some((mv_uci, wdl)) = tablebase::probe_root(pos) {
             let wdl_str = match wdl { 1 => "WIN", -1 => "LOSS", _ => "DRAW" };
@@ -270,30 +407,39 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
                     -1 => -TB_WIN_IN_MAX,
                     _  =>  0,
                 };
-                info.tb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                info.pv[0][0] = parsed;
-                info.pv_len[0] = 1;
-                info.root_score = tb_score;
+                if wdl == 1 {
+                    // Defer to a mate-seeking search; DTZ move is the fallback (handled below).
+                    tb_dtz_fallback = Some((parsed, tb_score));
+                } else {
+                    info.tb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    info.pv[0][0] = parsed;
+                    info.pv_len[0] = 1;
+                    info.root_score = tb_score;
 
-                if info.print_info {
-                    let elapsed = tm.elapsed_ms().max(1);
-                    print!("info depth 1 seldepth 1 score ");
-                    if is_mate_score(tb_score) {
-                        let mate_in = if tb_score > 0 {
-                            (MATE_SCORE - tb_score + 1) / 2
+                    if info.print_info {
+                        let elapsed = tm.elapsed_ms().max(1);
+                        print!("info depth 1 seldepth 1 score ");
+                        if is_mate_score(tb_score) {
+                            let mate_in = if tb_score > 0 {
+                                (MATE_SCORE - tb_score + 1) / 2
+                            } else {
+                                -(MATE_SCORE + tb_score + 1) / 2
+                            };
+                            print!("mate {} ", mate_in);
                         } else {
-                            -(MATE_SCORE + tb_score + 1) / 2
-                        };
-                        print!("mate {} ", mate_in);
-                    } else {
-                        print!("cp 0 ");
+                            print!("cp 0 ");
+                        }
+                        println!("nodes 1 nps 0 hashfull 0 tbhits 1 time {} pv {}", elapsed, mv_uci);
                     }
-                    println!("nodes 1 nps 0 hashfull 0 tbhits 1 time {} pv {}", elapsed, mv_uci);
+                    return parsed;
                 }
-                return parsed;
             }
         }
     }
+
+    // Suppress non-root TB probes during the TB-win mate search so it sees a true mate
+    // distance (a forced mate), not a flat TB-win score from the in-tree Syzygy probe.
+    info.suppress_tb = tb_dtz_fallback.is_some();
 
     // Iterative deepening
     for depth in 1..=tm.max_depth() {
@@ -364,20 +510,55 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
             tm.update_forced(info.root_moves_count, eval_diff);
         }
 
-        // Stop if we found mate — but only once a WINNING mate has been verified.
-        // A mate score appearing at shallow depth from a warm TT entry is unverified and
+        // Stop if we found mate — but only once a WINNING decisive score has been verified.
+        // A decisive score appearing at shallow depth from a warm TT entry is unverified and
         // may encode a non-progressing / repeating move → instant depth-1 shuffle into a
-        // draw (uEn2qBri R+N+4P vs K). TB-wins and losing mates exit immediately as before;
-        // the time manager bounds the extra search for long winning mates.
+        // draw (uEn2qBri R+N+4P vs K), OR a horizon-effect "mate" whose refutation lies just
+        // past the shallow horizon → material dump (oK4cHVVs: warm-TT 'mate 67' = Qg3+ queen
+        // sac, refuted by Kxg3 at depth ~6). Crucially, a winning mate whose ply-distance has
+        // drifted past MAX_PLY via warm-TT score_from_tt ply-correction lands BELOW MATE_IN_MAX,
+        // i.e. in the SAME numeric band as a TB-win score (mate ≥65 moves → score < 28872). The
+        // old guard treated that band as "TB-win → exit instantly", trusting the bogus mate
+        // without ever searching the refutation (depth 1–5, tens–hundreds of nodes, budget
+        // unused). Fix: only LOSING decisive scores exit immediately (can't improve); every
+        // WINNING decisive score — pure mate OR TB-win band — must be verified to its claimed
+        // depth before we trust it. The cold search collapses bogus warm-TT mates and surfaces
+        // the refutation; the time manager bounds the extra search for genuine long wins.
         if is_mate_score(best_score) {
-            if best_score < MATE_IN_MAX {
-                break; // TB-win or losing decisive score → exit as before
+            if best_score < 0 {
+                break; // losing decisive (being mated / TB-loss) → can't improve, exit
             }
             let mate_plies = MATE_SCORE - best_score; // halfmoves until we deliver mate
             if depth >= mate_plies {
-                break; // winning mate fully verified at this nominal depth
+                break; // winning decisive score verified at this nominal depth
             }
-            // else: keep deepening to verify the mate and pick a progressing move
+            // else: keep deepening — forces a real search past the shallow TT horizon,
+            // collapsing inflated warm-TT "mates" and surfacing the true best move.
+        }
+
+        // Mate-aware TB-root guard: in a TB-WIN position, once the capped search has spent
+        // its node budget without a forced mate, stop and use the DTZ fallback below
+        // (a winning mate would already have broken out via the mate block above).
+        if tb_dtz_fallback.is_some()
+            && info.nodes >= TB_MATE_PROBE_NODES
+            && !(is_mate_score(best_score) && best_score >= MATE_IN_MAX)
+        {
+            break;
+        }
+    }
+
+    info.suppress_tb = false;
+
+    // If a TB-WIN position yielded no forced mate from the search, fall back to the DTZ move
+    // for clean 50-move-rule conversion (the search's cp-best line ignores the zeroing
+    // constraint). A found winning mate keeps the search move (guard skipped).
+    if let Some((dtz_move, dtz_score)) = tb_dtz_fallback {
+        if !(is_mate_score(best_score) && best_score >= MATE_IN_MAX) {
+            info.tb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info.pv[0][0] = dtz_move;
+            info.pv_len[0] = 1;
+            info.root_score = dtz_score;
+            return dtz_move;
         }
     }
 
@@ -499,7 +680,7 @@ fn pvs(
     }
 
     // Syzygy tablebase probe (non-root, non-excluded, sufficient depth)
-    if !is_root && excluded == Move::NULL && !in_check
+    if !is_root && excluded == Move::NULL && !in_check && !info.suppress_tb
         && depth >= tablebase::probe_depth() as i32
     {
         if let Some(wdl) = tablebase::probe_wdl(pos) {

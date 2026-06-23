@@ -1,6 +1,6 @@
 [package]
 name = "clrsrc"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "A high-performance UCI chess engine with self-trained NNUE evaluation"
@@ -23,3 +23,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = false
+
+# `kani` ist nur unter dem Kani-Verifier gesetzt (Beweis-Harnesses in src/search.rs unter
+# #[cfg(kani)]); hier als bekanntes cfg deklariert, damit der normale Build nicht warnt.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

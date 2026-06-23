@@ -46,6 +46,11 @@ pub fn init() {
 }
 
 pub fn piece_key(color: Color, pt: PieceType, sq: Square) -> u64 {
+    // Implizite Vorbedingung (Kani-Befund 11.06): PieceType::None hat index()==6, aber
+    // PIECE_KEYS hat nur NUM_PIECE_TYPES==6 Einträge (0..5) → None wäre OOB. None wird nie
+    // gehasht; der debug_assert macht die Annahme explizit (Release-frei, fängt's im Test).
+    debug_assert!(pt.index() < NUM_PIECE_TYPES, "piece_key: kein Hash-Key für {:?} (index {} >= {})", pt, pt.index(), NUM_PIECE_TYPES);
+    debug_assert!((sq as usize) < 64, "piece_key: Square {} out of range", sq);
     unsafe { PIECE_KEYS[color.index()][pt.index()][sq as usize] }
 }
 
@@ -54,6 +59,7 @@ pub fn castling_key(rights: CastlingRights) -> u64 {
 }
 
 pub fn ep_key(file: u8) -> u64 {
+    debug_assert!((file as usize) < 8, "ep_key: file {} out of range (EP_KEYS hat 8 Einträge)", file);
     unsafe { EP_KEYS[file as usize] }
 }
 

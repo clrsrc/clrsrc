@@ -337,9 +337,14 @@ fn play_game(
         ply_count += 1;
     }
 
-    // Fill in game result
+    // Fill in game result — STM-relative (bullet stores/expects result from the side-to-move's
+    // perspective; see bulletformat ChessBoard::new flip for stm==1). game_result is WHITE-relative
+    // (0=black win, 1=draw, 2=white win), so flip it for black-to-move positions. buf[29] = pos.side.
+    // Bug fixed 2026-06-13: previously written unflipped → black-to-move WDL targets were inverted
+    // (empirical decode: result==2 score>0 ratio 97% white-to-move vs 4.8% black-to-move). See Fact #61.
     for entry in &mut game_entries {
-        entry[26] = game_result;
+        let stm_is_white = entry[29] == 0;
+        entry[26] = if stm_is_white { game_result } else { 2 - game_result };
     }
 
     game_entries

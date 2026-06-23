@@ -2,6 +2,42 @@
 
 All notable changes to clrsrc are documented here.
 
+## [1.2.0] - 2026-06-23
+
+### Added
+- **New NNUE — KB16 architecture.** The embedded network is now a `768 → 1024` perspective
+  network with **16 king-input buckets** and **8 output buckets** (SCReLU), replacing the previous
+  4-king-bucket `768 → 768` net. This is the headline strength gain of the release.
+- **rule50 evaluation scaling.** The NNUE output is scaled by `(200 - halfmove_clock) / 200`, so a
+  saturated net no longer overrates positions that are in fact drifting toward the 50-move draw
+  (anti-shuffle / draw-distance awareness, as used by Stockfish/Lynx and others).
+- **Mop-up endgame term.** A gated king-drive gradient (`≈ 4.7·CMD + 1.6·(14 - MD)`) for *pawnless,
+  decisively winning* positions only, to convert wins beyond tablebase range faster. Gated by
+  material so it cannot affect normal play and never flips the sign of a winning score.
+
+### Changed
+- **Time management (TMV1).** Higher soft-limit inflation cap and increment/defence-time
+  refinements so the engine spends its clock more sensibly in sharp and must-defend positions.
+- The search-tree changes above give a new reference `bench` node count of **1,527,458**
+  (was 1,352,208). The default network is still embedded — the bare binary is self-contained.
+
+### Fixed
+- **Warm-TT mate handling / TT mate-band.** A winning decisive score (mate *or* tablebase-win band)
+  is now re-verified to its claimed depth before it is trusted, so a shallow warm-TT "mate" can no
+  longer trigger an instant material dump or a shuffle into a draw; combined with a mate-aware
+  tablebase-root guard.
+- **Embedded-engine PV consistency.** When the embedded API is used, the reported principal
+  variation now always begins with the move actually played. Previously a time-aborted final
+  iteration could surface a PV from the discarded depth. Move selection and the standalone UCI
+  output were never affected.
+- **Datagen WDL targets.** Win/draw/loss targets are now stored side-to-move-relative;
+  black-to-move positions had been written with inverted results.
+
+### Internal
+- `debug_assert` bounds in the Zobrist key lookups, a Miri UB-sweep over move generation /
+  make-unmake / perft, and Kani proof harnesses (score↔TT roundtrip, move packing, LMR index
+  clamp, Zobrist involution).
+
 ## [1.1.1] - 2026-06-09
 
 ### Added

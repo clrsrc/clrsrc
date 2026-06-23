@@ -2,7 +2,7 @@
 // Phase-aware with stability-based scaling.
 
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 pub static STOP: AtomicBool = AtomicBool::new(false);
 pub static PONDERING: AtomicBool = AtomicBool::new(false);
@@ -10,6 +10,30 @@ pub static PONDERING: AtomicBool = AtomicBool::new(false);
 /// When false: engine ignores `go ponder` commands (treats as normal `go`) and does NOT
 /// append "ponder X" to its `bestmove` output. Default true (standard UCI behavior).
 static ALLOW_PONDER: AtomicBool = AtomicBool::new(true);
+
+/// Initial base time (ms) of the current game, captured at ply ≤ 1 (≈ full clock).
+/// 0 = not yet captured this game. Used solely to detect a genuine *bullet game*
+/// so the bullet-aware `time_adjust` floor is NOT applied to blitz/rapid low-time
+/// endgames (which share the same low *remaining* time but are SPRT-validated).
+/// Re-captured every game because ply resets to 0/1 at game start (UCI + embedded).
+static GAME_BASE_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Bullet-aware floor on the per-move `time_adjust` term (see build()). The legacy
+/// `time_adjust = 0.3272·log10(time_left) − 0.4141` collapses toward ~0 at short TC
+/// (≈0.07 at 30 s, ≈0.17 at 60 s vs ≈0.32 at blitz 180 s), starving bullet of search
+/// depth: clrsrc banks the clock / increment and is mated on the board with 50–105 %
+/// of its clock unused (Lichess bullet ~124 Elo < blitz, 71/71 board losses, 0 flags,
+/// sub-peer losses to −200 Elo). Flooring `time_adjust` to a blitz-like level makes
+/// bullet spend a healthy fraction of its clock → deeper search. Applied ONLY when the
+/// captured base time classifies the game as bullet. 0.0 = legacy behaviour.
+/// SPRT-tune in [0.35, 0.70]; MUST be confirmed non-regressing at blitz before deploy.
+/// 0.0 here (validated baseline) for the public v1.2.0 cut — the unvalidated A/B value is
+/// NOT shipped publicly. A LIVE bullet A/B at 0.50 runs independently on the VServer bot
+/// (separate embedded binary, since 22.06; self-play-unvalidatable, so only the live run can
+/// decide; data-starved → re-check ~04.07). If that A/B validates, set 0.50 + rebuild + a
+/// follow-up release. Blitz/rapid/bench provably inert via the is_bullet gate either way
+/// (game_base + 40·inc ≤ 179 s); bench unchanged (1527458).
+const BULLET_TA_FLOOR: f64 = 0.0;
 
 pub fn signal_ponderhit() {
     // End pondering. We deliberately do NOT reset the search clock: the time already spent
@@ -139,6 +163,17 @@ impl TimeManager {
         let time = if is_white { tc.wtime } else { tc.btime };
         let inc = if is_white { tc.winc } else { tc.binc };
 
+        // Bullet-aware TM (21.06): capture the game's initial base time at ply ≤ 1
+        // (clock still ≈ full) so we can lift the per-move floor ONLY for genuine
+        // bullet games. A fresh game always re-enters ply 0/1 → self-resetting.
+        if game_ply <= 1 && time > 0 {
+            GAME_BASE_MS.store(time, Ordering::Relaxed);
+        }
+        let game_base = GAME_BASE_MS.load(Ordering::Relaxed);
+        // Lichess speed classifier: estimated game duration = base + 40·inc.
+        // Bullet (incl. ultrabullet) < 180 s → boost; blitz (≥ 180 s) untouched.
+        let is_bullet = game_base > 0 && game_base + 40 * inc <= 179_000;
+
         if time <= 0 {
             tm.soft_limit_ms = 100;
             tm.hard_limit_ms = 100;
@@ -175,7 +210,12 @@ impl TimeManager {
             let max_const = (3.3744 + 3.0608 * log_time).max(3.1441);
 
             // TC-adaptive adjust: more time per move when total game time is bigger.
-            let time_adjust = (0.3272 * (time_left).log10() - 0.4141).max(0.0);
+            // Bullet-aware floor (21.06): in genuine bullet games this term otherwise
+            // collapses (~0.07 at 30 s) and starves search → board losses with the clock
+            // unused. Floor it to a blitz-like level so bullet actually spends its time.
+            // Blitz/rapid (incl. low-time endgames) keep floor 0.0 = legacy tuning.
+            let ta_floor = if is_bullet { BULLET_TA_FLOOR } else { 0.0 };
+            let time_adjust = (0.3272 * (time_left).log10() - 0.4141).max(ta_floor);
 
             let opt_scale = ((0.012112 + (game_ply as f64 + 3.22713).powf(0.46866) * opt_const)
                              .min(0.19404 * time as f64 / time_left))
@@ -308,7 +348,13 @@ impl TimeManager {
         // Rapid 600+5). HARD is left untouched (a running iteration may finish); only the
         // start-new-iteration budget is bounded. Invisible at fast TC / fast HW (the BM
         // stabilises before the budget binds), so this is an SPRT-at-Rapid-TC change. Tunable.
-        const SOFT_INFLATION_CAP: f64 = 1.50;
+        // Flat-Defense-Fix v1 (17.06, bot #186 + chess_engines #48): 1.50 deckelte die
+        // Kritikalitäts-Eskalation (score_factor bis 2.0× bei Eval-Kippen, stability bis 2.5×
+        // bei BM-Wechsel) auf 1.5× base_soft → defensiv-schlechte Stellungen bekamen flach zu
+        // wenig Zeit (kein fail-low-Extend sichtbar). 1.50→2.50 lässt den Verteidigungs-Extend
+        // atmen; der Forfeit-Schutz bleibt orthogonal (bot-max_deadline-Polling + hard-Clamp),
+        // analog Berserk/Viri-Vorbild (soft atmet, separate Hard-Decke fängt Runaway).
+        const SOFT_INFLATION_CAP: f64 = 2.50;
         let soft_ceiling = (self.base_soft_limit_ms as f64 * SOFT_INFLATION_CAP) as i64;
         let scaled_soft = (self.base_soft_limit_ms as f64 * total) as i64;
         self.soft_limit_ms = scaled_soft.min(soft_ceiling).min(self.hard_limit_ms).max(1);

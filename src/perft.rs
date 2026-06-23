@@ -120,3 +120,29 @@ pub fn run_suite() {
         println!("\nSome perft tests FAILED!");
     }
 }
+
+#[cfg(test)]
+mod miri_ub_sweep {
+    use super::*;
+    use crate::board::Position;
+    // Gezielter perft(2)-UB-Sweep über movegen / make / unmake / magic-BB-Lookup / static-mut.
+    // 3 Stellungen statt startpos-Tiefe: weniger Knoten (schneller unter Miri ~100×), aber
+    // bessere unsafe-Coverage — Rochade, en-passant, Promotion, Captures (die Sonderzug-
+    // Pfade, die startpos früh NICHT hat). Deckt das data-dependent unsafe ab, das Kani
+    // statisch nicht erreicht.
+    #[test]
+    fn perft_ub_sweep() {
+        crate::zobrist::init();
+        crate::magic::init();
+        crate::attacks::init();
+        // startpos perft(2): Basis movegen / make / unmake / magic-BB (400 Knoten)
+        let mut sp = Position::startpos();
+        assert_eq!(perft(&mut sp, 2), 400);
+        // Kiwipete perft(2): Rochade (O-O/O-O-O) + viele Captures (2039 Knoten)
+        let mut kp = Position::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1").unwrap();
+        assert_eq!(perft(&mut kp, 2), 2_039);
+        // Position 5 perft(2): en-passant + Promotion = Sonderzug-unsafe-Pfade (1486 Knoten)
+        let mut p5 = Position::from_fen("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8").unwrap();
+        assert_eq!(perft(&mut p5, 2), 1_486);
+    }
+}

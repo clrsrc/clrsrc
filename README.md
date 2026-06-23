@@ -16,9 +16,9 @@ distributed cluster of laptops and smartphones.
 
 - **Original Rust engine** — bitboard board representation, magic-bitboard move
   generation, fully legal move generation, Zobrist hashing.
-- **Self-trained NNUE evaluation** — a `768 → 768` perspective network with
-  4 king-input buckets and SCReLU activation, trained with
-  [bullet](https://github.com/jw1912/bullet) on ~200M self-play positions that
+- **Self-trained NNUE evaluation** — a `768 → 1024` perspective network with
+  16 king-input buckets, 8 output buckets and SCReLU activation, trained with
+  [bullet](https://github.com/jw1912/bullet) on self-play positions that
   were re-labelled ("rescored") with Stockfish evaluations.
 - **Modern search** — iterative deepening, principal variation search,
   transposition table, null-move pruning, late move reductions, futility &
@@ -40,7 +40,7 @@ The [Releases](../../releases) page provides:
 
 | Artifact | Description |
 |----------|-------------|
-| `clrsrc-1.1.1-windows-x86_64.exe` | Windows x86-64 binary — **self-contained** (the NNUE is embedded); portable build (`x86-64-v2` baseline + runtime AVX2/AVX-512 dispatch for the NNUE); build from source with `target-cpu=native` for a small extra speed-up |
+| `clrsrc-1.2.0-windows-x86_64.exe` | Windows x86-64 binary — **self-contained** (the NNUE is embedded); portable build (`x86-64-v2` baseline + runtime AVX2/AVX-512 dispatch for the NNUE); build from source with `target-cpu=native` for a small extra speed-up |
 | `clrsrc_v32_seed_b.nnue` | The trained evaluation network (optional — already embedded in the binary; only needed to override `EvalFile`) |
 | `jugernaut_v4.book` | Opening / experience book in JBK2 format (optional — see below) |
 
@@ -96,7 +96,7 @@ From the command line:
 ```
 $ ./clrsrc
 uci
-id name clrsrc 1.1.1
+id name clrsrc 1.2.0
 ...
 uciok
 ```

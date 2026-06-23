@@ -124,9 +124,23 @@ pub fn search_embedded(
     let best = crate::search::search(pos, info, &mut tm);
 
     // Pull the rest of the outcome from SearchInfo (populated by search()).
+    // `best` is the move of the last fully-completed depth (search.rs:461, set
+    // only after the abort-break). A time-aborted final iteration can leave
+    // `info.pv[0]` holding the PARTIAL line of the aborted depth, whose pv[0][0]
+    // may differ from `best` (e.g. a re-tried root move that transiently raised
+    // alpha before the abort). update_pv keeps pv[0] internally consistent
+    // (pv[0][0] + its own continuation), so the line is trustworthy IFF it still
+    // starts with the returned best; otherwise it belongs to the discarded
+    // aborted depth → fall back to a best-only PV so the reported/harvested PV
+    // always matches the played move (Shg8ehfe: best=Bf2 vs pv[0]=Nb3). UCI is
+    // unaffected — it prints the PV inside the loop, per completed depth.
     let pv_len = info.pv_len[0];
-    let pv: Vec<Move> = info.pv[0][..pv_len].to_vec();
-    let ponder = if pv_len >= 2 { Some(info.pv[0][1]) } else { None };
+    let pv: Vec<Move> = if pv_len > 0 && info.pv[0][0] == best {
+        info.pv[0][..pv_len].to_vec()
+    } else {
+        vec![best]
+    };
+    let ponder = if pv.len() >= 2 { Some(pv[1]) } else { None };
 
     let score = info.root_score;
     let mate = if score.abs() >= crate::search::TB_WIN_IN_MAX {
