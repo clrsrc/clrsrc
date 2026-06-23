@@ -23,6 +23,9 @@
 !/NNUE_FORMAT.md
 !/src/
 !/tests/
+!/RELEASE_CHECKLIST.md
+!/tools/
+!/hooks/
 
 # 3. Safety nets inside the re-included directories.
 #    (Nothing build- or cache-related should ever be committed.)

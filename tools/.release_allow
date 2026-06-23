@@ -1,0 +1,6 @@
+# Vetted false positives for tools/prerelease_check.py — format: <path-suffix>:<substring>
+# Each line whitelists a tracked-file line that matches a hard pattern but is legitimate.
+
+# "Stefan Meyer-Kahlen" is the co-author of the UCI protocol (Shredder author), a credited
+# third party — NOT the maintainer. Legitimate attribution in CREDITS.
+CREDITS.md:Meyer-Kahlen

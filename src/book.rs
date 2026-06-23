@@ -1021,12 +1021,14 @@ mod tests {
 
     #[test]
     fn expmerge_matches_golden_fixture() {
-        // Byte-conformance against the jugernaut reference merge (exp_v2::merge_with).
-        // Fixture lives in the chess_engine tree; skip cleanly if not present here.
-        let dir = r"P:\Projekte\chess_engine\postfach\fixtures";
-        let book_p = format!(r"{}\merge_golden_book.bin", dir);
-        let overlay_p = format!(r"{}\merge_golden_overlay.bin", dir);
-        let expected_p = format!(r"{}\merge_golden_expected.bin", dir);
+        // Byte-conformance against the reference merge (exp_v2::merge_with). The golden
+        // fixtures are not shipped with the public repo; point CLRSRC_GOLDEN_FIXTURE_DIR at a
+        // local copy to run this test, otherwise it skips cleanly (files absent).
+        let dir = std::env::var("CLRSRC_GOLDEN_FIXTURE_DIR")
+            .unwrap_or_else(|_| "tests/fixtures".to_string());
+        let book_p = format!("{}/merge_golden_book.bin", dir);
+        let overlay_p = format!("{}/merge_golden_overlay.bin", dir);
+        let expected_p = format!("{}/merge_golden_expected.bin", dir);
         let (book, overlay, expected) = match (
             ExpBook::load(&book_p),
             ExpBook::load(&overlay_p),

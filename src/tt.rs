@@ -25,7 +25,7 @@ const BUCKET_SIZE: usize = 2;
 // penalty=4 → -15 Elo, penalty=1 → -7 Elo (both regress: tax the common age=1 carry-over).
 // Threshold variant: only age >= TT_AGING_THRESHOLD is aged (age=1 = previous move = bulk-neutral).
 // Aging inert gestellt (age<=255 < 9999) -> verhaltens-clean = Prod 3D8AC150.
-// Threshold-Variante (36f8e198) ist als Binary archiviert, Stefan-geparkt.
+// Threshold-Variante (36f8e198) ist als Binary archiviert, geparkt.
 const TT_AGING_THRESHOLD: i32 = 9999;
 const TT_AGING_DEPTH_PENALTY: i32 = 2;
 

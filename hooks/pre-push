@@ -1,0 +1,15 @@
+#!/bin/sh
+# clrsrc public-repo guardrail — runs before every push so PII / internal references /
+# a non-portable target-cpu=native can never reach the public GitHub repo (the v0.3.0
+# leak class). Activate once per clone:  git config core.hooksPath hooks
+#
+# Emergency override (NEVER for a public release):  git push --no-verify
+python tools/prerelease_check.py
+status=$?
+if [ "$status" -ne 0 ]; then
+  echo ""
+  echo "PUSH BLOCKED by tools/prerelease_check.py (see HARD FAIL above)."
+  echo "Fix the violations, or whitelist a vetted false positive in tools/.release_allow."
+  exit 1
+fi
+exit 0
