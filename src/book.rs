@@ -667,13 +667,33 @@ impl ExpBook {
             return None;
         }
         let eff_variety = variety;
-        let best_score = entries.iter().map(|e| e.score).max().unwrap();
+        // has_eval hier hochgezogen (wird sonst erst im WDL-Filter definiert): ein Eintrag traegt
+        // ein echtes Engine-Urteil nur via jug/sf/nnue oder clrsrc_score (gueltig nur bei ENGINE-Bit).
+        let has_eval = |e: &ExpEntry| {
+            e.jug_score != EXP_SCORE_NONE
+                || e.sf_score != EXP_SCORE_NONE
+                || e.nnue_eval != EXP_SCORE_NONE
+                || (e.source & EXP_SOURCE_ENGINE != 0 && e.clrsrc_score != EXP_SCORE_NONE)
+        };
+        // Pool-Tiering: gibt es evaluierte Eintraege am Knoten, ankert der Cutoff auf den besten
+        // EVALUIERTEN Score und der Pool ist auf evaluierte Eintraege beschraenkt. Un-evaluierte
+        // score=0-Harvest-Zuege ankern den Cutoff nicht mehr auf 0 und verwaessern den Pool nicht.
+        // Nur im reinen Harvest-Knoten (kein Eval) -> alle Eintraege (erhaelt Buchtiefe/Time-Banking).
+        let any_eval = entries.iter().any(|e| has_eval(e));
+        let best_score = if any_eval {
+            entries.iter().filter(|e| has_eval(e)).map(|e| e.score).max().unwrap()
+        } else {
+            entries.iter().map(|e| e.score).max().unwrap()
+        };
         let cutoff = match eff_variety {
             1 => best_score.saturating_sub(15),
             2 => best_score.saturating_sub(30),
             _ => best_score,
         };
-        let in_cutoff: Vec<&ExpEntry> = entries.iter().filter(|e| e.score >= cutoff).collect();
+        let in_cutoff: Vec<&ExpEntry> = entries
+            .iter()
+            .filter(|e| e.score >= cutoff && (!any_eval || has_eval(e)))
+            .collect();
         // WDL quality filter — opening-book hygiene. Three fixes over the old
         // `total<6 || loss*2<total+2`, which let a 0-win queen-hang ride the small-sample grace
         // while wrongly filtering established Black mainlines:
@@ -684,15 +704,7 @@ impl ExpBook {
         //      from the random pool even at a single loss — neither eval nor record can vouch for it.
         const WDL_MIN_SAMPLE: i32 = 6;   // below this a move is "unproven"
         const WDL_BAR_SAMPLE: i32 = 20;  // only well-sampled siblings set the comparison bar
-        // An entry carries a real engine judgment only via jug/sf/nnue (sentinel EXP_SCORE_NONE)
-        // or clrsrc_score — and the latter is valid ONLY when source & EXP_SOURCE_ENGINE
-        // (otherwise it is the default 0, NOT an eval). Pure-harvest entries have none of these.
-        let has_eval = |e: &ExpEntry| {
-            e.jug_score != EXP_SCORE_NONE
-                || e.sf_score != EXP_SCORE_NONE
-                || e.nnue_eval != EXP_SCORE_NONE
-                || (e.source & EXP_SOURCE_ENGINE != 0 && e.clrsrc_score != EXP_SCORE_NONE)
-        };
+        // `has_eval` ist oben (Pool-Tiering) definiert.
         let win_rate = |e: &ExpEntry| {
             let t = e.wdl_w as i32 + e.wdl_l as i32;
             e.wdl_w as f32 / t as f32
@@ -728,22 +740,13 @@ impl ExpBook {
                 }
             })
             .collect();
-        // Fallback must NOT re-admit filtered junk (the old `in_cutoff` fallback silently bypassed
-        // every gate). If nothing survives, play the single safest deterministic-best move instead.
-        let pool = if wdl_ok.is_empty() {
-            let best = in_cutoff
-                .iter()
-                .max_by(|a, b| {
-                    a.depth
-                        .cmp(&b.depth)
-                        .then(a.count.cmp(&b.count))
-                        .then(a.score.cmp(&b.score))
-                })
-                .unwrap();
-            return decode_poly_move(pos, best.packed_move);
-        } else {
-            wdl_ok
-        };
+        // F2: alle Kandidaten gefiltert -> keinen gefilterten Junk re-admitten. Der alte Fallback
+        // spielte den "sichersten" gefilterten Zug ewig weiter (Single-Entry-Junk-Key 0W/>=1L =
+        // bekannt verlierender Buchzug jede Partie). None -> die Suche entscheidet stattdessen.
+        if wdl_ok.is_empty() {
+            return None;
+        }
+        let pool = wdl_ok;
 
         if eff_variety == 0 {
             // Deterministic best.

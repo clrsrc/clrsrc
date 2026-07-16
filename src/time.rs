@@ -2,7 +2,7 @@
 // Phase-aware with stability-based scaling.
 
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 
 pub static STOP: AtomicBool = AtomicBool::new(false);
 pub static PONDERING: AtomicBool = AtomicBool::new(false);
@@ -92,6 +92,34 @@ impl TimeControl {
     }
 }
 
+// ---- TM-Trigger 2: Konvertierungs-Floor (docs/spec_tm_conversion_floor.md) ----
+// In gewonnenen Konvertierungsstellungen (v_root >= Threshold, Endspiel, Uhr gesund)
+// feuern alle drei adaptiven Schrumpf-Faktoren gleichzeitig (stability 0.75 x
+// node_tm 0.5 x score 0.5 = bis ~0.19x soft) — die Suche verlaeuft den Gewinn flach
+// bei voller Uhr. Der Floor clampt das adaptive Produkt auf >=1.0 (forced_factor bleibt
+// ausgenommen: only-move/Zwangszug weiter instant) und boostet soft um ConvExtend%.
+// NUR soft — hard strukturell unangetastet (apply_factors-min-Clamp + SOFT_INFLATION_CAP).
+// Default AN (public v1.3.0, SPRT-validiert). Braucht nur ein geladenes NNUE, kein Sidecar.
+static CONV_ENABLED: AtomicBool = AtomicBool::new(true);
+static CONV_THRESHOLD: AtomicU32 = AtomicU32::new(200);   // cp (Root-NNUE-Eval, stm)
+static CONV_EXTEND: AtomicU32 = AtomicU32::new(50);       // % auf soft (0 = nur Floor)
+static CONV_MAXPIECES: AtomicU32 = AtomicU32::new(16);    // popcount(occupied)-Endspiel-Gate
+static CONV_MINREMAIN: AtomicU32 = AtomicU32::new(5000);  // ms — Uhr-Gesundheits-Gate
+static CONV_LOG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_conv_enabled(v: bool) { CONV_ENABLED.store(v, Ordering::Relaxed); }
+pub fn conv_enabled() -> bool { CONV_ENABLED.load(Ordering::Relaxed) }
+pub fn set_conv_threshold(v: u32) { CONV_THRESHOLD.store(v.clamp(100, 1000), Ordering::Relaxed); }
+pub fn conv_threshold() -> u32 { CONV_THRESHOLD.load(Ordering::Relaxed) }
+pub fn set_conv_extend(v: u32) { CONV_EXTEND.store(v.min(200), Ordering::Relaxed); }
+pub fn conv_extend() -> u32 { CONV_EXTEND.load(Ordering::Relaxed) }
+pub fn set_conv_maxpieces(v: u32) { CONV_MAXPIECES.store(v.clamp(5, 32), Ordering::Relaxed); }
+pub fn conv_maxpieces() -> u32 { CONV_MAXPIECES.load(Ordering::Relaxed) }
+pub fn set_conv_minremaining(v: u32) { CONV_MINREMAIN.store(v.min(60_000), Ordering::Relaxed); }
+pub fn conv_minremaining() -> u32 { CONV_MINREMAIN.load(Ordering::Relaxed) }
+pub fn set_conv_log(v: bool) { CONV_LOG.store(v, Ordering::Relaxed); }
+pub fn conv_log() -> bool { CONV_LOG.load(Ordering::Relaxed) }
+
 pub struct TimeManager {
     start: Instant,
     base_soft_limit_ms: i64,  // original soft limit (before factor scaling)
@@ -109,6 +137,8 @@ pub struct TimeManager {
     score_factor: f64,      // Stash 2^(-Δscore/100), per-iter (NOT accumulated)
     node_tm_factor: f64,    // node-based factor (existing)
     forced_factor: f64,     // Patch B Phase 2: 1 legal=0.01, strong-forced=0.39, weak-forced=0.63, else 1.0
+    conv_active: bool,      // TM-Trigger 2: Konvertierungs-Floor scharf (einmal je Suche, Root)
+    remaining_ms: i64,      // eigene Uhr bei build() — fuer das ConvMinRemaining-Gate
     max_deadline: Option<Instant>, // C2 (embedded): absolute wall-clock ceiling from the bot.
                             // None for the UCI path (behaviour unchanged). When Some, it caps the
                             // computed limits AND is enforced directly in should_stop_hard().
@@ -147,6 +177,8 @@ impl TimeManager {
             score_factor: 1.0,
             node_tm_factor: 1.0,
             forced_factor: 1.0,
+            conv_active: false,
+            remaining_ms: 0,
             max_deadline,
         };
 
@@ -162,6 +194,7 @@ impl TimeManager {
 
         let time = if is_white { tc.wtime } else { tc.btime };
         let inc = if is_white { tc.winc } else { tc.binc };
+        tm.remaining_ms = time.max(0);
 
         // Bullet-aware TM (21.06): capture the game's initial base time at ply ≤ 1
         // (clock still ≈ full) so we can lift the per-move floor ONLY for genuine
@@ -333,9 +366,32 @@ impl TimeManager {
     /// Apply combined stability × score × node × forced factor to soft/hard limits.
     /// hard can only SHRINK from base (preserves patch-A-v2 cap as upper bound).
     /// soft is recomputed from base × total, then clamped to hard.
+    /// TM-Trigger 2: Konvertierungs-Floor scharf schalten (einmal je Suche an der Root,
+    /// Eval-/Steine-Gates prueft der Aufrufer in search()). Das Uhr-Gesundheits-Gate
+    /// (ConvMinRemaining) liegt hier, weil nur der TimeManager die eigene Uhr kennt.
+    /// Wirkt via apply_factors nur aufs SOFT-Budget; hard kann dort nie ueber base
+    /// wachsen (min-Clamp) — kein neuer Flag-Pfad. Returns ob das Gate durchging.
+    pub fn set_conv_active(&mut self) -> bool {
+        if self.infinite || self.base_hard_limit_ms == i64::MAX { return false; }
+        if self.remaining_ms < conv_minremaining() as i64 { return false; }
+        self.conv_active = true;
+        self.apply_factors();
+        true
+    }
+
     fn apply_factors(&mut self) {
         if self.infinite || self.base_hard_limit_ms == i64::MAX { return; }
-        let total = self.stability_factor * self.score_factor * self.node_tm_factor * self.forced_factor;
+        // TM-Trigger 2 (Konvertierungs-Floor): die drei ADAPTIVEN Faktoren duerfen in
+        // scharfgeschalteter Konvertierungslage nicht mehr schrumpfen (Floor >=1.0) und
+        // soft bekommt den ConvExtend-Boost. forced_factor bleibt bewusst aussen vor:
+        // only-move (0.01) und echte Zwangszuege (0.39/0.63) sollen weiter instant kommen.
+        let adaptive = self.stability_factor * self.score_factor * self.node_tm_factor;
+        let adaptive = if self.conv_active {
+            adaptive.max(1.0) * (1.0 + conv_extend() as f64 / 100.0)
+        } else {
+            adaptive
+        };
+        let total = adaptive * self.forced_factor;
         let scaled_hard = (self.base_hard_limit_ms as f64 * total) as i64;
         self.hard_limit_ms = scaled_hard.min(self.base_hard_limit_ms).max(1);
         // Cap how far the SOFT limit (the "start a new iteration" gate) may inflate above its

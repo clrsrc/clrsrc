@@ -22,7 +22,7 @@
 use crate::types::*;
 use crate::board::Position;
 use crate::movegen;
-use crate::search::{self, SearchInfo, MATE_IN_MAX};
+use crate::search::{self, SearchInfo, MINIMUM_MATE_SCORE};
 use crate::time::{TimeControl, TimeManager};
 use crate::attacks;
 use crate::book::{
@@ -195,7 +195,7 @@ fn play_game(
                 packed_move: book::encode_poly_move(played_move),
                 clrsrc_score: played_score.clamp(-32000, 32000) as i16,
                 depth: played_depth.clamp(0, i16::MAX as i32) as i16,
-                mate: played_score.abs() >= MATE_IN_MAX,
+                mate: played_score.abs() >= MINIMUM_MATE_SCORE,
                 mover_is_white,
             });
         }
@@ -329,7 +329,7 @@ fn play_game_seeded(
         packed_move: book::encode_poly_move(chosen),
         clrsrc_score: mini_score.clamp(-32000, 32000) as i16,
         depth: mini_depth.clamp(0, i16::MAX as i32) as i16,
-        mate: mini_score.abs() >= MATE_IN_MAX,
+        mate: mini_score.abs() >= MINIMUM_MATE_SCORE,
         mover_is_white,
     };
 

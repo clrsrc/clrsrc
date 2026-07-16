@@ -6,7 +6,7 @@
 use crate::types::*;
 use crate::board::Position;
 use crate::movegen;
-use crate::search::{self, SearchInfo, MATE_IN_MAX};
+use crate::search::{self, SearchInfo, MINIMUM_MATE_SCORE};
 use crate::time::{TimeControl, TimeManager};
 use crate::attacks;
 use crate::bitboard::pop_lsb;
@@ -309,7 +309,7 @@ fn play_game(
         }
 
         // Record position (with filters)
-        let dominated_by_mate = score.abs() >= MATE_IN_MAX;
+        let dominated_by_mate = score.abs() >= MINIMUM_MATE_SCORE;
         let dominated_by_score = score.abs() >= SCORE_FILTER;
         let in_check = pos.is_in_check();
         let too_early = ply_count < MIN_RECORD_PLY;

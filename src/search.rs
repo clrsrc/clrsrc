@@ -18,10 +18,15 @@ use crate::tablebase;
 
 pub const INFINITY: i32 = 30000;
 pub const MATE_SCORE: i32 = 29000;
-pub const MATE_IN_MAX: i32 = MATE_SCORE - MAX_PLY as i32;
-// TB-win scores live in [TB_WIN_IN_MAX, MATE_IN_MAX); pure mate scores in [MATE_IN_MAX, MATE_SCORE].
-// Both ranges are ply-relative and need TT adjustment + UCI mate-display.
-pub const TB_WIN_IN_MAX: i32 = MATE_IN_MAX - MAX_PLY as i32;
+// Band-Geometrie (Viridithas-analog, mate/TB-win banding rework):
+// Matt-Scores in [MATE_SCORE-MAX_PLY, MATE_SCORE], klassifiziert ab MINIMUM_MATE_SCORE;
+// TB-Wins um TB_WIN_SCORE±MAX_PLY, "decisive" ab MINIMUM_TB_WIN_SCORE. Der Gap zwischen
+// MINIMUM_MATE_SCORE (28700) und der TB-Band-Oberkante (28128) ist >> MAX_PLY, damit
+// ply-Drift einen Matt-Score strukturell NIE ins TB-Band schieben kann (der 18.06er
+// Gap=0-Design-Flaw). Bandbreite 300 = 2·MAX_PLY+44 wie Viridithas.
+pub const MINIMUM_MATE_SCORE: i32 = MATE_SCORE - 300; // 28700: is_mate-Klassifikation
+pub const TB_WIN_SCORE: i32 = MATE_SCORE - 1000; // 28000: TB-Win-Basis (emittiert ∓ply)
+pub const MINIMUM_TB_WIN_SCORE: i32 = TB_WIN_SCORE - 300; // 27700: is_decisive-Schwelle
 // Node budget for the mate-aware TB-root guard: in a TB-WIN position, search up to this
 // many nodes for a forced mate before falling back to the DTZ move (which may sacrifice
 // material to zero the 50-move clock). A NODE cap (not depth) is the right measure: the
@@ -31,16 +36,21 @@ pub const TB_WIN_IN_MAX: i32 = MATE_IN_MAX - MAX_PLY as i32;
 // multi-second mate computation. Only active in TB positions → bench-neutral.
 pub const TB_MATE_PROBE_NODES: u64 = 2_000_000;
 
-/// Is this a decisive (mate or TB-win) score?
+/// Is this a decisive score (mate OR TB-win, beide Bänder)?
+fn is_decisive(score: i32) -> bool {
+    score.abs() >= MINIMUM_TB_WIN_SCORE
+}
+
+/// Is this a TRUE mate score (nicht TB-Win)? UCI/Consumer melden nur hierfür "mate N".
 fn is_mate_score(score: i32) -> bool {
-    score.abs() >= TB_WIN_IN_MAX
+    score.abs() >= MINIMUM_MATE_SCORE
 }
 
 /// Adjust mate/TB-win score for TT storage (convert ply-relative to position-relative)
 fn score_to_tt(score: i32, ply: i32) -> i16 {
-    if score >= TB_WIN_IN_MAX {
+    if score >= MINIMUM_TB_WIN_SCORE {
         (score + ply) as i16
-    } else if score <= -TB_WIN_IN_MAX {
+    } else if score <= -MINIMUM_TB_WIN_SCORE {
         (score - ply) as i16
     } else {
         score as i16
@@ -59,10 +69,17 @@ mod kani_proofs {
     fn score_tt_roundtrip_and_no_overflow() {
         let score: i32 = kani::any();
         let ply: i32 = kani::any();
+        let clock: i32 = kani::any();
         kani::assume(score >= -MATE_SCORE && score <= MATE_SCORE); // Engine-Score-Range [-29000,29000]
         kani::assume(ply >= 0 && ply < MAX_PLY as i32);            // gültige Suchtiefe [0,128)
+        kani::assume(clock >= 0 && clock <= 100);                  // halfmove clock
         let stored: i16 = score_to_tt(score, ply);                // i16-Store; Kani prüft Overflow
-        let recovered: i32 = score_from_tt(stored, ply);
+        let s = stored as i32;
+        // Roundtrip gilt exakt auf der Nicht-Downgrade-Domäne (Fix 2 demoted absichtlich
+        // rule50-tote Matts — dort ist Verlust der Zweck, kein Bug).
+        kani::assume(!(s >= MINIMUM_MATE_SCORE && MATE_SCORE - s > 100 - clock));
+        kani::assume(!(s <= -MINIMUM_MATE_SCORE && MATE_SCORE + s > 100 - clock));
+        let recovered: i32 = score_from_tt(stored, ply, clock);
         assert_eq!(recovered, score, "TT-Score-Roundtrip muss verlustfrei sein");
     }
 
@@ -122,12 +139,23 @@ mod kani_proofs {
     }
 }
 
-/// Adjust mate/TB-win score from TT (convert position-relative to ply-relative)
-fn score_from_tt(score: i16, ply: i32) -> i32 {
+/// Adjust mate/TB-win score from TT (convert position-relative to ply-relative).
+/// Fix 2 (SF/Viri-Muster, chess_engines #56): rule50-Downgrade VOR der ±ply-Korrektur —
+/// ein "Matt", dessen Distanz die 50-Zug-Regel nicht mehr zulässt (MATE_SCORE−s > 100−clock),
+/// wird auf MINIMUM_TB_WIN_SCORE−1 demoted (= knapp unter decisive). Killt Falsch-Matts,
+/// die die 50-Zug-Regel längst erledigt hat (GHI-Schutz). TB-Win-Ast bleibt bewusst ohne
+/// Downgrade (flat Encoding, Viri-Ast B feuert nie — #56 Punkt 2).
+fn score_from_tt(score: i16, ply: i32, clock: i32) -> i32 {
     let s = score as i32;
-    if s >= TB_WIN_IN_MAX {
+    if s >= MINIMUM_TB_WIN_SCORE {
+        if s >= MINIMUM_MATE_SCORE && MATE_SCORE - s > 100 - clock {
+            return MINIMUM_TB_WIN_SCORE - 1; // 27699
+        }
         s - ply
-    } else if s <= -TB_WIN_IN_MAX {
+    } else if s <= -MINIMUM_TB_WIN_SCORE {
+        if s <= -MINIMUM_MATE_SCORE && MATE_SCORE + s > 100 - clock {
+            return -(MINIMUM_TB_WIN_SCORE - 1);
+        }
         s + ply
     } else {
         s
@@ -290,6 +318,32 @@ fn contempt_draw_score(pos: &Position) -> i32 {
     }
 }
 
+/// Does the side to move have at least one legal move?
+///
+/// SF-Muster (position.cpp::is_draw, `rule50 > 99 && (!checkers() || MoveList<LEGAL>.size())`):
+/// der 50-Zug-Draw darf NICHT feuern, wenn die Seite am Zug schachmatt ist — ein Matt,
+/// dessen Schlusszug den Zaehler exakt auf 100 bringt, ist ein Matt, kein Remis (FIDE).
+/// Ethereal/Viri haben den Bug (Ethereal source-kommentiert); nur SF prueft Checkmate zuerst.
+/// Kosten: voller Movegen NUR im seltenen hmc>=100-&&-in_check-Fall (early-exit beim ersten
+/// legalen Zug). Siehe bug_rule50_mate_priority / chess_engines #60/#61.
+fn has_legal_move(pos: &mut Position) -> bool {
+    let mut list = MoveList::new();
+    movegen::generate_all(pos, &mut list);
+    for i in 0..list.len {
+        let mv = list.moves[i];
+        let undo = pos.make_move(mv);
+        let ksq = pos.king_sq(pos.side.flip());
+        let legal = ksq < 64
+            && !attacks::is_attacked(&pos.pieces, &pos.colors, ksq, pos.side)
+            && pos.king_sq(pos.side) < 64;
+        pos.unmake_move(mv, undo);
+        if legal {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if the current position is a repetition.
 /// Only checks positions since last irreversible move (capture, pawn move).
 /// Returns true on 2-fold repetition (single repeat = draw during search).
@@ -380,6 +434,27 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
         info.nnue.refresh(pos, &mut info.acc_stack[0]);
     }
 
+    // TM-Trigger 2 (Konvertierungs-Floor, docs/spec_tm_conversion_floor.md): einmal je Suche
+    // an der Root. Kostet max. eine statische Eval pro `go` — kein Suchbaum-/NPS-Pfad. In
+    // gewonnenen Konvertierungslagen (hohes v_root, Endspiel, Uhr gesund) floort es die drei
+    // adaptiven Schrumpf-Faktoren auf >=1.0 und boostet soft um ConvExtend%. NUR soft — hard
+    // strukturell unangetastet. Braucht nur ein geladenes NNUE (kein Sidecar).
+    if crate::time::conv_enabled() && info.nnue.is_loaded() && !info.silent {
+        let occ = crate::bitboard::popcount(pos.occupancy());
+        let bucket = crate::nnue::output_bucket_for_occupied(occ);
+        let v_root = info.nnue.evaluate(&info.acc_stack[0], pos.side, bucket);
+        // v_root ist statische NNUE-Eval (strukturell nie im Matt-Band). Uhr-Gesundheits-Gate
+        // (ConvMinRemaining) prueft set_conv_active.
+        if v_root >= crate::time::conv_threshold() as i32
+            && occ <= crate::time::conv_maxpieces()
+            && tm.set_conv_active()
+            && crate::time::conv_log()
+        {
+            println!("info string conv v={} pieces={} floor+soft*{:.2}",
+                     v_root, occ, 1.0 + crate::time::conv_extend() as f64 / 100.0);
+        }
+    }
+
     let mut best_move = Move::NULL;
     let mut best_score = -INFINITY;
 
@@ -403,8 +478,8 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
             eprintln!("info string TB root probe: {} (move {})", wdl_str, mv_uci);
             if let Some(parsed) = pos.parse_uci_move(&mv_uci) {
                 let tb_score = match wdl {
-                    1  =>  TB_WIN_IN_MAX,
-                    -1 => -TB_WIN_IN_MAX,
+                    1  =>  TB_WIN_SCORE,
+                    -1 => -TB_WIN_SCORE,
                     _  =>  0,
                 };
                 if wdl == 1 {
@@ -419,16 +494,9 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
                     if info.print_info {
                         let elapsed = tm.elapsed_ms().max(1);
                         print!("info depth 1 seldepth 1 score ");
-                        if is_mate_score(tb_score) {
-                            let mate_in = if tb_score > 0 {
-                                (MATE_SCORE - tb_score + 1) / 2
-                            } else {
-                                -(MATE_SCORE + tb_score + 1) / 2
-                            };
-                            print!("mate {} ", mate_in);
-                        } else {
-                            print!("cp 0 ");
-                        }
+                        // TB-Scores liegen jetzt im eigenen Band → nie "mate N" (#56 Punkt 3),
+                        // decisive TB-LOSS/DRAW als grosses/0 cp melden.
+                        print!("cp {} ", tb_score);
                         println!("nodes 1 nps 0 hashfull 0 tbhits 1 time {} pv {}", elapsed, mv_uci);
                     }
                     return parsed;
@@ -501,7 +569,7 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
         // Patch B Phase 2: forced-move detection (1 legal => 0.01x; eval-diff>400 => 0.39x; >170 => 0.63x).
         // Skip on mate-score iterations: forced-detection vs mate-PV is misleading and the iteration
         // will break out anyway.
-        if !is_mate_score(best_score) {
+        if !is_decisive(best_score) {
             let eval_diff = if info.root_second_best == i32::MIN {
                 i32::MAX // only one root move tracked => effectively infinite gap
             } else {
@@ -516,7 +584,7 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
         // draw (uEn2qBri R+N+4P vs K), OR a horizon-effect "mate" whose refutation lies just
         // past the shallow horizon → material dump (oK4cHVVs: warm-TT 'mate 67' = Qg3+ queen
         // sac, refuted by Kxg3 at depth ~6). Crucially, a winning mate whose ply-distance has
-        // drifted past MAX_PLY via warm-TT score_from_tt ply-correction lands BELOW MATE_IN_MAX,
+        // drifted past MAX_PLY via warm-TT score_from_tt ply-correction lands BELOW MINIMUM_MATE_SCORE,
         // i.e. in the SAME numeric band as a TB-win score (mate ≥65 moves → score < 28872). The
         // old guard treated that band as "TB-win → exit instantly", trusting the bogus mate
         // without ever searching the refutation (depth 1–5, tens–hundreds of nodes, budget
@@ -524,16 +592,19 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
         // WINNING decisive score — pure mate OR TB-win band — must be verified to its claimed
         // depth before we trust it. The cold search collapses bogus warm-TT mates and surfaces
         // the refutation; the time manager bounds the extra search for genuine long wins.
-        if is_mate_score(best_score) {
+        if is_decisive(best_score) {
             if best_score < 0 {
                 break; // losing decisive (being mated / TB-loss) → can't improve, exit
             }
-            let mate_plies = MATE_SCORE - best_score; // halfmoves until we deliver mate
-            if depth >= mate_plies {
-                break; // winning decisive score verified at this nominal depth
+            if is_mate_score(best_score) {
+                let mate_plies = MATE_SCORE - best_score; // halfmoves until we deliver mate
+                if depth >= mate_plies {
+                    break; // winning mate fully verified at this nominal depth
+                }
+                // else: keep deepening — forces a real search past the shallow TT horizon,
+                // collapsing inflated warm-TT "mates" and surfacing the true best move.
             }
-            // else: keep deepening — forces a real search past the shallow TT horizon,
-            // collapsing inflated warm-TT "mates" and surfacing the true best move.
+            // positive TB-win band: keep deepening (mate-probe guard below caps via nodes)
         }
 
         // Mate-aware TB-root guard: in a TB-WIN position, once the capped search has spent
@@ -541,7 +612,7 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
         // (a winning mate would already have broken out via the mate block above).
         if tb_dtz_fallback.is_some()
             && info.nodes >= TB_MATE_PROBE_NODES
-            && !(is_mate_score(best_score) && best_score >= MATE_IN_MAX)
+            && !(is_mate_score(best_score) && best_score > 0)
         {
             break;
         }
@@ -553,7 +624,7 @@ pub fn search(pos: &mut Position, info: &mut SearchInfo, tm: &mut TimeManager) -
     // for clean 50-move-rule conversion (the search's cp-best line ignores the zeroing
     // constraint). A found winning mate keeps the search move (guard skipped).
     if let Some((dtz_move, dtz_score)) = tb_dtz_fallback {
-        if !(is_mate_score(best_score) && best_score >= MATE_IN_MAX) {
+        if !(is_mate_score(best_score) && best_score > 0) {
             info.tb_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info.pv[0][0] = dtz_move;
             info.pv_len[0] = 1;
@@ -635,7 +706,7 @@ fn pvs(
     // unreachable, so matefix's ID-break never fires). Mirrors the depth>=1 draw
     // detection below. See [[bug_tt_matt_shuffle_depth0]].
     if depth <= 0 {
-        if pos.halfmove_clock >= 100 {
+        if pos.halfmove_clock >= 100 && (!in_check || has_legal_move(pos)) {
             return contempt_draw_score(pos);
         }
         if !is_root && is_repetition(info, pos.hash, pos.halfmove_clock) {
@@ -672,7 +743,9 @@ fn pvs(
     // Draw detection: fifty-move rule and repetition. Material-aware contempt
     // so the side with a material advantage avoids drawing into a repetition.
     // See [[rep_in_winning_endgame]] for the motivating Lichess incidents.
-    if pos.halfmove_clock >= 100 {
+    // rule50-mate-priority (chess_engines #60/#61): der 50-Zug-Draw feuert nicht, wenn die
+    // Seite am Zug schachmatt ist (SF is_draw-Muster) — Grenz-Matt mit Zaehler exakt 100.
+    if pos.halfmove_clock >= 100 && (!in_check || has_legal_move(pos)) {
         return contempt_draw_score(pos);
     }
     if !is_root && is_repetition(info, pos.hash, pos.halfmove_clock) {
@@ -725,7 +798,7 @@ fn pvs(
 
     if let Some(entry) = info.tt.probe(pos.hash) {
         tt_move = entry.best_move;
-        let s = score_from_tt(entry.score, ply);
+        let s = score_from_tt(entry.score, ply, pos.halfmove_clock as i32);
         tt_eval = Some(entry.eval as i32);
         tt_depth = entry.depth;
         tt_flag = entry.flag;
@@ -776,7 +849,7 @@ fn pvs(
     if !is_pv && !in_check && excluded == Move::NULL {
         // Reverse Futility Pruning (margin adjusts with improving)
         let rfp_margin = if improving { tune::get(&tune::RFP_MARGIN_IMP) } else { tune::get(&tune::RFP_MARGIN_NIMP) };
-        if depth <= tune::get(&tune::RFP_DEPTH) && static_eval - rfp_margin * depth >= beta && !is_mate_score(beta) {
+        if depth <= tune::get(&tune::RFP_DEPTH) && static_eval - rfp_margin * depth >= beta && !is_decisive(beta) {
             return static_eval;
         }
 
@@ -817,7 +890,7 @@ fn pvs(
 
             if info.stopped || time::should_stop() { return 0; }
             if score >= beta {
-                return if is_mate_score(score) { beta } else { score };
+                return if is_decisive(score) { beta } else { score };
             }
         }
 
@@ -830,7 +903,7 @@ fn pvs(
         }
 
         // ProbCut: at high depths, do a shallow search to verify if position is much above beta
-        if depth >= tune::get(&tune::PROBCUT_DEPTH) && !is_mate_score(beta) {
+        if depth >= tune::get(&tune::PROBCUT_DEPTH) && !is_decisive(beta) {
             let pb_beta = beta + tune::get(&tune::PROBCUT_MARGIN);
             let pb_depth = depth - 4;
 
@@ -972,7 +1045,7 @@ fn pvs(
         let hist_score = unsafe { scores[i].assume_init() };
 
         // ---- Pre-move pruning (non-root, non-PV, not in check) ----
-        if !is_root && !is_pv && !in_check && best_score > -MATE_IN_MAX && moves_searched > 0 {
+        if !is_root && !is_pv && !in_check && best_score > -MINIMUM_MATE_SCORE && moves_searched > 0 {
             // Late Move Pruning
             if is_quiet_move && moves_searched >= lmp_threshold as u32 {
                 continue;
@@ -1001,10 +1074,12 @@ fn pvs(
             }
         }
 
-        // ---- Singular Extension ----
+        // ---- Singular Extension (DISABLED: `false &&` short-circuit) ----
+        // SPRT-validated: disabling SE at our TCs was a strength gain (+SE-off). The block
+        // is kept intact behind a const-false guard for provenance / easy re-enable.
         let mut extension = 0;
-        if depth >= tune::get(&tune::SE_DEPTH) && mv == tt_move && excluded == Move::NULL
-            && tt_score.is_some() && !is_mate_score(tt_score.unwrap())
+        if false && depth >= tune::get(&tune::SE_DEPTH) && mv == tt_move && excluded == Move::NULL
+            && tt_score.is_some() && !is_decisive(tt_score.unwrap())
             && tt_depth as i32 >= depth - 3
             && (tt_flag == FLAG_LOWER || tt_flag == FLAG_EXACT)
         {
@@ -1251,7 +1326,7 @@ fn pvs(
 
         // Update correction histories: learn from the difference between
         // raw static eval and search result (only for non-mate, non-check, quiet nodes)
-        if !in_check && !is_mate_score(best_score) && raw_eval != -INFINITY {
+        if !in_check && !is_decisive(best_score) && raw_eval != -INFINITY {
             let diff = best_score - raw_eval;
             info.correction_history.update(pos.side, pos.pawn_hash, diff, depth);
         }
@@ -1306,7 +1381,7 @@ fn quiescence(
     // TT probe in qsearch
     let mut qs_tt_move = Move::NULL;
     if let Some(entry) = info.tt.probe(pos.hash) {
-        let tt_s = score_from_tt(entry.score, ply);
+        let tt_s = score_from_tt(entry.score, ply, pos.halfmove_clock as i32);
         qs_tt_move = entry.best_move;
         // TT cutoff in qsearch (not when in check — need to verify we have evasions)
         if !in_check {

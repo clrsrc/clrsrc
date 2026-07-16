@@ -89,6 +89,13 @@ pub fn uci_loop() {
                 println!("option name Syzygy50MoveRule type check default true");
                 println!("option name Ponder type check default true");
                 println!("option name LongTimeNMP type check default false");
+                // TM-Trigger 2: Konvertierungs-Floor (default AN, SPRT-validiert).
+                println!("option name ConvFloor type check default true");
+                println!("option name ConvThreshold type spin default 200 min 100 max 1000");
+                println!("option name ConvExtend type spin default 50 min 0 max 200");
+                println!("option name ConvMaxPieces type spin default 16 min 5 max 32");
+                println!("option name ConvMinRemaining type spin default 5000 min 0 max 60000");
+                println!("option name ConvLog type check default false");
                 // Only show tuning options if requested (avoid GUI clutter)
                 // GUIs can still set them without seeing them
                 for p in tune::all_params() {
@@ -280,7 +287,7 @@ pub fn uci_loop() {
                             if thread_info.completed_depth >= learn_min_depth {
                                 let root_pos = Position::from_fen(&fen).unwrap();
                                 let rs = thread_info.root_score;
-                                let is_mate = rs.abs() >= search::MATE_IN_MAX;
+                                let is_mate = rs.abs() >= search::MINIMUM_MATE_SCORE;
                                 let score16 = rs.clamp(i16::MIN as i32 + 1, i16::MAX as i32) as i16;
                                 let mut flags = EXP_FLAG_VALIDATED;
                                 if is_mate {
@@ -443,6 +450,35 @@ fn cmd_setoption(tokens: &[&str], info: &mut SearchInfo, tt: &mut SharedTT, num_
                 "bestbookmove" => {
                     let val = tokens[vi + 1].to_lowercase();
                     *best_book = val == "true" || val == "1";
+                }
+                "convfloor" => {
+                    let val = tokens[vi + 1].to_lowercase();
+                    crate::time::set_conv_enabled(val == "true" || val == "1");
+                    eprintln!("info string ConvFloor = {}", crate::time::conv_enabled());
+                }
+                "convthreshold" => {
+                    if let Ok(v) = tokens[vi + 1].parse::<u32>() {
+                        crate::time::set_conv_threshold(v);
+                    }
+                }
+                "convextend" => {
+                    if let Ok(v) = tokens[vi + 1].parse::<u32>() {
+                        crate::time::set_conv_extend(v);
+                    }
+                }
+                "convmaxpieces" => {
+                    if let Ok(v) = tokens[vi + 1].parse::<u32>() {
+                        crate::time::set_conv_maxpieces(v);
+                    }
+                }
+                "convminremaining" => {
+                    if let Ok(v) = tokens[vi + 1].parse::<u32>() {
+                        crate::time::set_conv_minremaining(v);
+                    }
+                }
+                "convlog" => {
+                    let val = tokens[vi + 1].to_lowercase();
+                    crate::time::set_conv_log(val == "true" || val == "1");
                 }
                 "syzygypath" => {
                     let path = tokens[vi + 1..].join(" ");

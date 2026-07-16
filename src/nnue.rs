@@ -49,6 +49,34 @@ const BUCKET_LAYOUT_QS: [usize; 32] = [
 // Expanded to 64 squares (with horizontal mirroring applied)
 const BUCKET_LAYOUT: [usize; 64] = expand_bucket_layout();
 
+// Bucket-Zahl, fuer die dieses Binary kompiliert ist (max. Eintrag der LUT + 1).
+// Die Groessen-Autodetektion in load() akzeptiert sonst JEDES bucketed-Netz,
+// aber king_bucket_info indexiert IMMER mit dieser einkompilierten LUT — ein
+// Netz mit anderer Bucket-Zahl liefert Feature-Indizes ausserhalb des
+// feature_weights-Arrays (Panic Index-OOB) oder stillen Unsinn. Klarer Err statt Panic.
+const COMPILED_BUCKETS: usize = compiled_buckets();
+
+const fn compiled_buckets() -> usize {
+    let mut mx = 0;
+    let mut i = 0;
+    while i < 32 {
+        if BUCKET_LAYOUT_QS[i] > mx { mx = BUCKET_LAYOUT_QS[i]; }
+        i += 1;
+    }
+    mx + 1
+}
+
+/// Guard: bucketed-Netze sind nur mit der einkompilierten Bucket-Zahl ladbar.
+fn check_bucket_compat(b: usize, path: &str) -> Result<(), String> {
+    if b > 1 && b != COMPILED_BUCKETS {
+        return Err(format!(
+            "{}: net has {} king buckets, but this binary is compiled for {} (BUCKET_LAYOUT) — refusing to load (feature indices would go out of bounds)",
+            path, b, COMPILED_BUCKETS
+        ));
+    }
+    Ok(())
+}
+
 const fn expand_bucket_layout() -> [usize; 64] {
     let mirror_file: [usize; 8] = [0, 1, 2, 3, 3, 2, 1, 0];
     let mut out = [0usize; 64];
@@ -392,6 +420,7 @@ impl Nnue {
                     if h > MAX_HIDDEN || b > MAX_BUCKETS {
                         return Err(format!("H={} or B={} exceeds limits", h, b));
                     }
+                    check_bucket_compat(b, path)?;
                     return self.load_bullet_bucketed(data, path, h, b);
                 }
             }
@@ -409,6 +438,7 @@ impl Nnue {
                     if h > MAX_HIDDEN || b > MAX_BUCKETS {
                         return Err(format!("H={} or B={} exceeds limits", h, b));
                     }
+                    check_bucket_compat(b, path)?;
                     return self.load_bullet_outbucket(data, path, h, b);
                 }
             }
@@ -424,6 +454,7 @@ impl Nnue {
                     if h > MAX_HIDDEN || b > MAX_BUCKETS {
                         return Err(format!("H={} or B={} exceeds limits", h, b));
                     }
+                    check_bucket_compat(b, path)?;
                     return self.load_bullet_threats_bucketed(data, path, h, b);
                 }
             }

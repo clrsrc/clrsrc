@@ -91,9 +91,9 @@ pub struct SearchOutcome {
     pub score_cp: i32,
     pub depth: i32,
     pub nodes: u64,
-    /// Mate-in-N (signed; negative = being mated). Mirrors the engine's own
-    /// reporting, which treats TB-wins as mate too (score.abs() >= TB_WIN_IN_MAX)
-    /// — see the known TB-win phantom-`mate` issue; not changed here.
+    /// Mate-in-N (signed; negative = being mated). Seit dem Band-Rework (Fix 1,
+    /// chess_engines #56) nur noch für ECHTE Matt-Scores (>= MINIMUM_MATE_SCORE) —
+    /// TB-Wins liegen im eigenen Band und melden None (Phantom-`mate` behoben).
     pub mate: Option<i32>,
 }
 
@@ -143,7 +143,7 @@ pub fn search_embedded(
     let ponder = if pv.len() >= 2 { Some(pv[1]) } else { None };
 
     let score = info.root_score;
-    let mate = if score.abs() >= crate::search::TB_WIN_IN_MAX {
+    let mate = if score.abs() >= crate::search::MINIMUM_MATE_SCORE {
         Some(if score > 0 {
             (crate::search::MATE_SCORE - score + 1) / 2
         } else {
@@ -198,6 +198,13 @@ pub struct EmbeddedConfig {
     pub own_book: bool,                   // probe the Polyglot fallback book
     pub book_file: Option<String>,        // Polyglot book path
     pub best_book_move: bool,             // Polyglot: pick best vs weighted-random
+    // TM-Trigger 2 (Konvertierungs-Floor; braucht nur ein geladenes NNUE, kein Sidecar).
+    // Spiegelt die UCI-Optionen ConvFloor/-Threshold/-Extend/-MaxPieces/-MinRemaining.
+    pub conv_floor: bool,                 // default true (public v1.3.0, SPRT-validiert)
+    pub conv_threshold: Option<u32>,      // Default 200 (cp, Root-Eval stm)
+    pub conv_extend: Option<u32>,         // Default 50 (% auf soft; 0 = nur Floor)
+    pub conv_maxpieces: Option<u32>,      // Default 16 (popcount-Endspiel-Gate)
+    pub conv_minremaining: Option<u32>,   // Default 5000 (ms Uhr-Gesundheits-Gate)
 }
 
 impl Default for EmbeddedConfig {
@@ -215,6 +222,11 @@ impl Default for EmbeddedConfig {
             own_book: false,
             book_file: None,
             best_book_move: true,
+            conv_floor: true,
+            conv_threshold: None,
+            conv_extend: None,
+            conv_maxpieces: None,
+            conv_minremaining: None,
         }
     }
 }
@@ -261,6 +273,13 @@ impl EmbeddedEngine {
         if let Some(l) = config.syzygy_probe_limit { crate::tablebase::set_probe_limit(l.min(7)); }
         if let Some(d) = config.syzygy_probe_depth { crate::tablebase::set_probe_depth(d.max(1).min(100)); }
         if let Some(b) = config.syzygy_50move { crate::tablebase::set_50move_rule(b); }
+
+        // TM-Trigger 2 (Konvertierungs-Floor): exakt die UCI-setoption-Pfade.
+        crate::time::set_conv_enabled(config.conv_floor);
+        if let Some(v) = config.conv_threshold { crate::time::set_conv_threshold(v); }
+        if let Some(v) = config.conv_extend { crate::time::set_conv_extend(v); }
+        if let Some(v) = config.conv_maxpieces { crate::time::set_conv_maxpieces(v); }
+        if let Some(v) = config.conv_minremaining { crate::time::set_conv_minremaining(v); }
 
         let exp = if config.play_from_exp {
             config.exp_file.as_ref().and_then(|p| if p.is_empty() { None } else { ExpBook::load(p) })
